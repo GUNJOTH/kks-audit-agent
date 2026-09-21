@@ -132,3 +132,10 @@ uv run python .\run_audit.py "D:\QQ\8.20_舟山汽机专业.xlsx" --output-dir .
 - 少量内部用户：在一台内网 Windows 电脑启动服务，浏览器共享地址。
 - 多人长期使用：部署到内网服务器，并在反向代理或网关层增加登录、HTTPS、上传大小限制和运行目录清理策略。
 - 生产环境：不要直接暴露到公网；当前版本没有用户登录、权限管理和自动清理历史文件。
+
+## 项目治理入口
+
+- [治理约定](./GOVERNANCE.md)
+- [贡献指南](./CONTRIBUTING.md)
+- [安全策略](./SECURITY.md)
+- Issue 与 Pull Request 请使用仓库模板，并记录实际验证证据。
