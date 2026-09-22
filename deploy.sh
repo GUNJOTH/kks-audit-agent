@@ -49,7 +49,13 @@ rm -rf "$BACKUP"
 # 4. 清理 Python 字节码缓存，避免旧代码残留
 find "$APP_DIR" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
 
-# 5. 重建并启动
+# 5. 端口绑定提示（compose 默认只绑回环，不发布到所有宿主网卡）
+if ! grep -qE '^[[:space:]]*KKS_BIND_ADDR=' .env 2>/dev/null; then
+  echo "==> 提示：.env 未设置 KKS_BIND_ADDR，服务将只监听 127.0.0.1（仅本机可访问）。"
+  echo "    需要从局域网访问，请在 .env 里加一行：KKS_BIND_ADDR=0.0.0.0"
+fi
+
+# 6. 重建并启动
 echo "==> docker compose up -d --build"
 docker compose up -d --build
 

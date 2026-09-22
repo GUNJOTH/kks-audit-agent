@@ -5,7 +5,9 @@ services:
     container_name: kks-audit
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      # 默认只监听回环地址，不再把 8080 发布到所有宿主网卡（评审要求：不要仅依赖 Docker 网络隔离）。
+      # 需要从局域网访问时，在 .env 里显式设置 KKS_BIND_ADDR=0.0.0.0（或指定内网 IP）后重启。
+      - "${KKS_BIND_ADDR:-127.0.0.1}:8080:8080"
     volumes:
       # 审核输出持久化(报告 HTML / 问题清单 Excel / 上传副本)
       - ./runs:/app/runs

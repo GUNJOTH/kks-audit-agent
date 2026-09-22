@@ -44,10 +44,18 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 RUN_ID_RE = re.compile(r"^[0-9]{8}T[0-9]{6}_[0-9a-f]{8}$")
 LOGGER = logging.getLogger("kks-audit")
 
-# 管理接口鉴权：保护配置读写、Skill 读写/上传、运行日志、AI 连接测试。
-# 这些接口一旦裸奔，攻击者可改 AI 地址后用已保存的 API Key 向自己的端点发请求，造成密钥外泄。
+# 管理接口鉴权：保护配置读写、Skill 读写/上传、运行日志、AI 连接测试、审计台账读写。
+# 1) 配置类接口一旦裸奔，攻击者可改 AI 地址后用已保存的 API Key 向自己的端点发请求，造成密钥外泄；
+# 2) 台账接口返回原始文件名、内容哈希、审核时间与 P0/P1/P2 等业务统计，属审核记录，不应对外公开。
+# 前端统一通过 jsonFetch 自动携带 Authorization；文件下载因 <a> 带不了请求头，改为 fetch + Blob。
 ADMIN_TOKEN_ENV = "KKS_ADMIN_TOKEN"
-PROTECTED_GET = {"/api/config", "/api/skill", "/api/logs"}
+PROTECTED_GET = {
+    "/api/config",
+    "/api/skill",
+    "/api/logs",
+    "/api/history",
+    "/api/history/download",
+}
 PROTECTED_POST = {"/api/config", "/api/skill", "/api/skill/upload", "/api/ai/test"}
 
 
@@ -256,7 +264,7 @@ html{font-size:16px}body{font-family:Inter,"Segoe UI","Microsoft YaHei",Arial,sa
  <div id="resultPanel" class="panel result-panel dashboard-results"><div class="panel-head result-panel-head"><div><h3>审核结果</h3><div class="muted">问题分布、问题预览和下载结果</div></div><span id="resultState" class="result-state idle">等待审核</span></div><div id="progressPanel" class="progress-panel" hidden><div class="progress-topline"><span id="progressText">准备审核</span><b id="progressPercent">0%</b></div><div class="progress-track"><div id="progressBar"></div></div><div id="progressHint" class="progress-hint">正在准备文件……</div></div><div id="result" class="result-box result-box-empty"><div class="result-message"><span class="result-message-icon" aria-hidden="true">◎</span><div><strong id="resultTitle">等待上传文件</strong><span id="resultSubtitle">审核完成后，问题分布和下载入口会显示在这里。</span></div></div></div><div id="resultDashboard" hidden><div class="severity-card"><div class="section-row"><h3>问题级别分布</h3><span class="info-dot">i</span></div><div class="severity-layout"><div class="severity-main"><div class="severity-bar"><span id="barP0"></span><span id="barP1"></span><span id="barP2"></span></div><div class="severity-legend"><span><i class="legend-dot p0"></i>P0 严重 <b id="legendP0">0</b></span><span><i class="legend-dot p1"></i>P1 重要 <b id="legendP1">0</b></span><span><i class="legend-dot p2"></i>P2 一般 <b id="legendP2">0</b></span></div></div><div id="issueDonut" class="issue-donut"><div><strong id="donutTotal">—</strong><small>问题总数</small></div></div><div class="valid-card"><span class="valid-icon">✓</span><div><small>有效编码</small><b id="resultDataRows">—</b><span id="validRate">—</span></div></div><div class="priority-card"><div class="priority-row"><span><i class="legend-dot p0"></i>P0 严重</span><b id="priorityP0Table">0</b></div><div class="priority-row"><span><i class="legend-dot p1"></i>P1 重要</span><b id="priorityP1Table">0</b></div><div class="priority-row"><span><i class="legend-dot p2"></i>P2 一般</span><b id="priorityP2Table">0</b></div><div class="priority-row total"><span>总计</span><b id="priorityTotal">0</b></div></div></div></div><div class="result-lower"><div class="issue-preview-card"><div class="section-row"><h3>问题预览（按规则分组）</h3><span class="text-action">点击节点展开/收起</span></div><div class="issue-table-wrap"><div id="issuePreview" class="issue-tree-box"><div class="empty-preview">审核完成后显示问题预览</div></div></div></div><div class="download-panel"><h3>下载结果</h3><div id="links" class="links result-downloads" hidden></div></div></div></div></div></section>
 <section id="skillPage" class="page"><div class="panel"><div class="panel-head"><div><h3>Skill 规则管理</h3><div class="muted">管理员可以查看、修改或上传 Skill 文件。Markdown 会影响 AI 参考上下文；audit_template.py 是可执行规则代码，修改后必须重启服务。</div></div><span style="padding:6px 10px;border-radius:999px;background:#fff1e6;color:#a95118;font-size:12px;font-weight:700;white-space:nowrap">管理员功能</span></div><div style="display:grid;grid-template-columns:minmax(230px,1fr) 2fr;gap:12px;align-items:center;margin:15px 0 10px"><label for="skillFile" style="font-size:13px;font-weight:700">当前文件</label><select id="skillFile" style="width:100%;border:1px solid var(--line);border-radius:9px;padding:11px 12px;font:inherit;color:var(--ink);background:#fff"></select></div><div id="skillMeta" class="skill-meta">选择文件后显示说明</div><div class="editor-toolbar"><span id="skillDirty" class="skill-badge">未修改</span><span id="skillCharCount">0 字符</span></div><textarea id="skill" class="skill-editor" spellcheck="false"></textarea><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px"><button id="saveSkill" class="btn btn-primary" type="button">保存当前文件</button><input id="skillUpload" type="file" accept=".md,.py,.zip" style="max-width:260px"><span id="skillUploadName" class="skill-upload-name muted">未选择文件</span><button id="uploadSkill" class="btn btn-secondary" type="button">上传 Skill 文件 / 包</button></div><div class="muted" style="margin-top:10px">支持单个 `.md` / `.py` 文件，也支持完整 `.zip` 包；系统只接收 SKILL.md、references/*.md 和 scripts/audit_template.py，并自动保留旧版本备份。</div><div id="skillStatus" class="status">正在加载 Skill……</div></div></section>
 <section id="configPage" class="page"><div class="panel"><div class="panel-head"><div><h3>AI 管理员配置</h3><div class="muted">修改接口地址、模型和 AI 复核开关。API 密钥只显示掩码，不会写入日志、报告或审核结果。</div></div><span style="padding:6px 10px;border-radius:999px;background:#fff1e6;color:#a95118;font-size:12px;font-weight:700;white-space:nowrap">管理员</span></div><div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin:0 0 14px;padding:12px 14px;border:1px solid #f0d9c8;background:#fffaf5;border-radius:10px"><div class="config-field" style="min-width:320px;flex:1"><label for="adminToken">管理令牌</label><input id="adminToken" type="password" autocomplete="new-password" placeholder="服务端 .env 中的 KKS_ADMIN_TOKEN"><span class="field-help">访问配置、Skill、日志、AI 测试等管理接口所需；仅保存在本机浏览器，不会上传到服务端。</span></div><button id="saveAdminToken" class="btn btn-secondary" type="button">保存令牌</button></div><div class="config-grid"><div class="config-field"><label for="baseUrl">AI 接口地址</label><input id="baseUrl" type="url" placeholder="https://example.com/v1"><span class="field-help">兼容 OpenAI 格式的 /v1 接口地址。</span></div><div class="config-field"><label for="model">模型名称</label><input id="model" type="text" placeholder="例如 deepseek-v4-flash"><span class="field-help">填写服务商实际提供的模型标识。</span></div><div class="config-field"><label for="apiKey">API 密钥</label><input id="apiKey" type="password" autocomplete="new-password" placeholder="留空表示保持现有密钥"><span class="field-help">保存后只显示掩码，留空不会覆盖原密钥。</span></div><div class="config-field"><label for="enabled">AI 复核开关</label><select id="enabled"><option value="true">启用</option><option value="false">停用</option></select><span class="field-help">停用时仍执行规则审核，但不调用模型。</span></div></div><label class="config-key-option"><input id="clearKey" type="checkbox"> 清空当前已保存的 API 密钥</label><div class="config-actions"><button id="saveConfig" class="btn btn-primary" type="button">保存配置</button><button id="testAi" class="btn btn-secondary" type="button">测试 AI 连接</button><span id="configDirty" class="skill-badge">未修改</span></div><div id="configStatus" class="status">正在读取配置……</div></div></section>
-<section id="logsPage" class="page"><div class="panel"><div class="panel-head"><div><h3>运行日志</h3><div class="muted">记录服务启动、文件审核、AI 状态和报告生成过程；不会记录 API 密钥。</div></div><div class="log-toolbar"><span id="logMeta" class="log-meta">尚未刷新</span><button id="refreshLogs" class="btn btn-secondary" type="button">刷新日志</button></div></div><pre id="logs" class="log-box">正在读取日志……</pre></div></section><section id="historyPage" class="page"><div class="panel"><div class="panel-head"><div><h3>审计台账</h3><div class="muted">每完成一次审核自动追加一条记录，并跨文件累计汇总；汇总报告可在本页直接下载，文件同时保存在服务端 runs 目录。</div></div><div class="log-toolbar"><a id="dlSummary" class="btn btn-secondary" style="text-decoration:none" href="/api/history/download" download>下载汇总报告</a><a id="dlLedger" class="btn btn-secondary" style="text-decoration:none" href="/api/history/download?type=ledger" download>下载台账 JSON</a><button id="refreshHistory" class="btn btn-secondary" type="button">刷新台账</button></div></div><div id="historyHost" class="muted" style="padding:6px 0">正在读取台账……</div></div></section>
+<section id="logsPage" class="page"><div class="panel"><div class="panel-head"><div><h3>运行日志</h3><div class="muted">记录服务启动、文件审核、AI 状态和报告生成过程；不会记录 API 密钥。</div></div><div class="log-toolbar"><span id="logMeta" class="log-meta">尚未刷新</span><button id="refreshLogs" class="btn btn-secondary" type="button">刷新日志</button></div></div><pre id="logs" class="log-box">正在读取日志……</pre></div></section><section id="historyPage" class="page"><div class="panel"><div class="panel-head"><div><h3>审计台账</h3><div class="muted">每完成一次审核自动追加一条记录，并跨文件累计汇总；汇总报告可在本页直接下载，文件同时保存在服务端 runs 目录。</div></div><div class="log-toolbar"><button id="dlSummary" class="btn btn-secondary" type="button">下载汇总报告</button><button id="dlLedger" class="btn btn-secondary" type="button">下载台账 JSON</button><button id="refreshHistory" class="btn btn-secondary" type="button">刷新台账</button></div></div><div id="historyHost" class="muted" style="padding:6px 0">正在读取台账……</div></div></section>
 </main></div><script>
 const form=document.getElementById('form'),submit=document.getElementById('submit'),result=document.getElementById('result'),links=document.getElementById('links');
 function adminTokenValue(){try{return localStorage.getItem('kksAdminToken')||''}catch(e){return ''}}
@@ -385,7 +393,7 @@ function loadHistory(){
   host.innerHTML='<div class="muted" style="padding:10px 0">正在读取台账……</div>';
   function esc(s){s=(s===null||s===undefined)?'':String(s);var d=document.createElement('div');d.textContent=s;return d.innerHTML}
   function rate(i,r){return r>0?(i/r*100).toFixed(1)+'%':'—'}
-  fetch('/api/history').then(function(r){return r.json()}).then(function(d){
+  jsonFetch('/api/history').then(function(d){
     var entries=(d&&d.entries)||[];
     var dlS=document.getElementById('dlSummary'),dlL=document.getElementById('dlLedger');
     if(dlS)dlS.style.display=entries.length?'':'none';
@@ -412,8 +420,21 @@ function loadHistory(){
       trend='<div class="biz-aisum" style="margin:12px 0"><div class="biz-aisum-h">AI 跨文件趋势总结<span class="biz-aisum-m">'+esc(t.model||'')+' ｜ 基于 '+(t.file_count||entries.length)+' 次审核 ｜ '+esc(t.ts||'')+'</span></div><p>'+esc(t.overall)+'</p>'+(tpts?'<ul>'+tpts+'</ul>':'')+'</div>';
     }
     host.innerHTML=kpis+trend+h+'<div class="muted" style="margin-top:8px;font-size:12px">点右上角「下载汇总报告」可导出完整汇总页（含 AI 趋势总结与本次 vs 历史平均对比）；服务端路径 runs/KKS审核台账汇总.html，台账原始数据 runs/audit_ledger.json。</div>';
-  }).catch(function(err){host.innerHTML='<div class="muted">读取台账失败：'+esc(err&&err.message)+'</div>'});
+  }).catch(function(err){host.innerHTML='<div class="muted">'+esc(isAuthErr(err)?('台账需管理令牌：'+authHint(err)):('读取台账失败：'+(err&&err.message)))+'</div>'});
 }
+function downloadLedger(kind){
+  var tk=adminTokenValue();
+  var url='/api/history/download'+(kind==='ledger'?'?type=ledger':'');
+  var fname=kind==='ledger'?'audit_ledger.json':'KKS审核台账汇总.html';
+  fetch(url,{headers:tk?{Authorization:'Bearer '+tk}:{}}).then(function(r){
+    if(!r.ok){return r.json().catch(function(){return {}}).then(function(d){var e=new Error(d.error||('下载失败 HTTP '+r.status));e.code=d.code;throw e})}
+    return r.blob();
+  }).then(function(b){
+    var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=fname;document.body.appendChild(a);a.click();
+    setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},1000);
+  }).catch(function(err){alert(isAuthErr(err)?('下载需管理令牌：'+authHint(err)):('下载失败：'+(err&&err.message)))});
+}
+(function(){var s=document.getElementById('dlSummary'),l=document.getElementById('dlLedger');if(s)s.onclick=function(){downloadLedger('summary')};if(l)l.onclick=function(){downloadLedger('ledger')}})();
 document.getElementById('refreshHistory').onclick=loadHistory;
 loadHistory();
 </script></body></html>"""

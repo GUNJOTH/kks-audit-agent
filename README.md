@@ -15,18 +15,26 @@
 在本目录执行：
 
 ```powershell
-python .\server.py --host 0.0.0.0 --port 8080 --runs-dir .\runs
+python .\server.py --host 127.0.0.1 --port 8080 --runs-dir .\runs
 ```
 
-浏览器打开 `http://服务器地址:8080/`，上传 Excel 即可。只在本机使用时，把 `--host` 改成 `127.0.0.1`。
+浏览器打开 `http://服务器地址:8080/`，上传 Excel 即可。默认只监听本机（`127.0.0.1`）；要让局域网同事访问，把 `--host` 改成 `0.0.0.0`（Docker 部署对应 `.env` 里的 `KKS_BIND_ADDR`），并务必先配置下面的管理令牌。
 
-别人使用时不需要 WorkBuddy，只需要能访问这台服务器的地址。服务提供：
+别人使用时不需要 WorkBuddy，只需要能访问这台服务器的地址。公开接口（无需令牌）：
 
 - `GET /`：浏览器上传页面；
 - `GET /healthz`：健康检查；
 - `POST /api/audits`：接收上传并创建后台审核任务，支持 multipart 字段 `file`，返回 `run_id`；
 - `GET /api/audits/{run_id}/status`：查询审核阶段、真实进度和 AI 全部候选复核状态；
-- `GET /api/audits/{run_id}/{文件名}`：按上传 Excel 文件名生成的 HTML 报告或 Excel 问题清单；
+- `GET /api/audits/{run_id}/{文件名}`：按上传 Excel 文件名生成的 HTML 报告或 Excel 问题清单。
+
+管理接口（需要管理令牌，携带方式 `Authorization: Bearer <token>` 或 `?token=<token>`；未配置 `KKS_ADMIN_TOKEN` 时一律返回 403）：
+
+- `GET/POST /api/config`：读取/保存 AI 配置；
+- `GET/POST /api/skill`、`POST /api/skill/upload`：读取/保存/上传 Skill；
+- `GET /api/logs`：运行日志；
+- `POST /api/ai/test`：AI 连接测试；
+- `GET /api/history`、`GET /api/history/download`：审计台账与汇总报告/JSON 下载。响应含原始文件名、内容哈希、审核时间和 P0/P1/P2 统计，属审核记录，因此同样纳入鉴权，不因页面展示需要而公开。
 
 ## 统一依赖环境（uv）
 
@@ -63,7 +71,9 @@ uv run python .\run_audit.py "D:\QQ\8.20_舟山汽机专业.xlsx" --compare-file
 
 AI 地址、模型和密钥由管理员预先写入 `config/app_config.json`，打包时随 EXE 一起发布。网页左侧的“AI 配置”是管理员配置页，可修改接口地址、模型、启用状态和 API 密钥，并可直接测试连接。密钥输入框不会回显原文，只显示掩码；留空保存表示保持原密钥。
 
-普通使用者只需要上传 Excel、查看报告和日志。当前服务没有内置登录认证；如果要在局域网多人使用，应在反向代理或内网访问控制层保护“AI 配置”页面和 `/api/config`、`/api/ai/test` 接口。API 密钥不要写入 Skill、Excel、报告或 Git。
+普通使用者只需要上传 Excel、查看报告和日志。管理接口（配置读写、Skill 读写上传、运行日志、AI 连接测试、审计台账与下载）统一由 `KKS_ADMIN_TOKEN` 保护：未配置该变量时这些接口一律返回 403（fail-closed），令牌缺失或不匹配返回 401，比较使用常量时间避免时序侧信道。令牌可用 `openssl rand -hex 24` 生成，写入 `.env` 后重启服务；浏览器端在「AI 配置」页填入同一令牌即可（保存在 localStorage，页面自动携带）。
+
+服务默认只监听回环地址，不发布到所有宿主网卡；需要局域网访问时显式设置绑定地址（Docker 用 `KKS_BIND_ADDR`），并保证管理令牌已配置。API 密钥不要写入 Skill、Excel、报告或 Git。
 
 ## 配置、Skill 和日志
 
