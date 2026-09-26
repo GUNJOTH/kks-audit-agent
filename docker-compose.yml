@@ -1,0 +1,30 @@
+services:
+  kks-audit:
+    build: .
+    image: kks-audit-agent:latest
+    container_name: kks-audit
+    restart: unless-stopped
+    ports:
+      # 默认只监听回环地址，不再把 8080 发布到所有宿主网卡（评审要求：不要仅依赖 Docker 网络隔离）。
+      # 需要从局域网访问时，在 .env 里显式设置 KKS_BIND_ADDR=0.0.0.0（或指定内网 IP）后重启。
+      - "${KKS_BIND_ADDR:-127.0.0.1}:8080:8080"
+    volumes:
+      # 审核输出持久化(报告 HTML / 问题清单 Excel / 上传副本)
+      - ./runs:/app/runs
+    environment:
+      TZ: Asia/Shanghai
+      # 管理接口令牌：保护 配置读写 / Skill 读写上传 / 日志 / AI 测试。
+      # 未设置时这些接口返回 403（fail-closed），必须在 .env 里配置。
+      KKS_ADMIN_TOKEN: ${KKS_ADMIN_TOKEN:-}
+      # AI 语义复核配置：docker compose 会自动读取同目录下的 .env 做变量插值。
+      # 这里逐项透传，缺项时注入空串——app_runtime 会把空值视为"未设置"，
+      # 自动回退到 Web「AI 配置」页保存的 config/app_config.json。
+      # 因此：.env 是隐藏文件，重新部署解压不会丢；app_config.json 由 deploy.sh 保留。
+      AI_ENABLED: ${AI_ENABLED:-}
+      AI_BASE_URL: ${AI_BASE_URL:-}
+      AI_API_KEY: ${AI_API_KEY:-}
+      AI_MODEL: ${AI_MODEL:-}
+      AI_TIMEOUT_SECONDS: ${AI_TIMEOUT_SECONDS:-}
+      AI_REVIEW_MAX_CANDIDATES: ${AI_REVIEW_MAX_CANDIDATES:-}
+      AI_SUMMARY_ENABLED: ${AI_SUMMARY_ENABLED:-}
+      AI_TREND_SUMMARY_ENABLED: ${AI_TREND_SUMMARY_ENABLED:-}

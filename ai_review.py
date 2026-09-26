@@ -19,6 +19,7 @@ import urllib.request
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -47,10 +48,10 @@ RULE_CONTEXT_HINTS = {
     "KKS-29": {"OCR", "易混", "字符"},
     "KKS-30": {"文本卫生", "空白", "控制符"},
     "KKS-31": {"父子", "名称", "语义"},
-    "KKS-13/16": {"旧码", "迁移", "历史"},
+    "KKS-13/16": {"旧码", "迁移", "历史", "旧前缀"},
     "KKS-14": {"系统字母", "重分配"},
     "KKS-15": {"设备字母", "位置", "变化"},
-    "KKS-16": {"旧格式", "迁移"},
+    "KKS-16": {"旧前缀", "历史提示"},
     "KKS-18": {"历史", "原码", "前缀"},
     "KKS-17/22": {"扩展码", "12 位", "部件", "信号"},
     "KKS-TREE-REL": {"父级", "子级", "跨子系统", "变长"},
@@ -68,6 +69,9 @@ class AIConfig:
     model: str
     timeout_seconds: int
     enabled: bool
+    max_candidates: int = 0
+    summary_enabled: bool = True   # 单文件总体总结（AI_SUMMARY_ENABLED）
+    trend_enabled: bool = True     # 台账跨文件趋势总结（AI_TREND_SUMMARY_ENABLED）
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -139,6 +143,9 @@ def load_config() -> AIConfig:
         model=environment_value("AI_MODEL", ai.get("model", "")).strip(),
         timeout_seconds=_parse_int(environment_value("AI_TIMEOUT_SECONDS", ai.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)), DEFAULT_TIMEOUT_SECONDS, 10, 300),
         enabled=enabled,
+        max_candidates=_parse_int(environment_value("AI_REVIEW_MAX_CANDIDATES", ai.get("max_candidates", 0)), 0, 0, 2000),
+        summary_enabled=_parse_bool(environment_value("AI_SUMMARY_ENABLED", ai.get("summary_enabled", "")), True),
+        trend_enabled=_parse_bool(environment_value("AI_TREND_SUMMARY_ENABLED", ai.get("trend_enabled", "")), True),
     )
 
 
@@ -865,6 +872,14 @@ def review_issue_candidates(result: dict[str, Any], progress_callback: ProgressC
         return base
 
     indexed = [(idx, issue) for idx, issue in enumerate(issues) if isinstance(issue, dict) and _is_candidate(issue)]
+    # 送审上限：AI_REVIEW_MAX_CANDIDATES>0 时按优先级(P0>P1>P2)截断，0=不限制
+    max_candidates = int(getattr(config, "max_candidates", 0) or 0)
+    if max_candidates and len(indexed) > max_candidates:
+        pr_rank = {"P0": 0, "P1": 1, "P2": 2}
+        indexed.sort(key=lambda pair: pr_rank.get(str(pair[1].get("priority", "P2")), 2))
+        base["candidate_total"] = len(indexed)
+        LOGGER.info("ai_candidates_truncated total=%s kept=%s", len(indexed), max_candidates)
+        indexed = indexed[:max_candidates]
     base["candidate_count"] = len(indexed)
     if not indexed:
         base["status"] = "completed"
@@ -997,3 +1012,164 @@ def test_ai_connection() -> dict[str, Any]:
         {"test": "kks-audit-connection"},
     )
     return {"ok": True, "status": "connected", "model": model, "model_source": source, "response": payload}
+
+
+def summarize_audit(result: dict[str, Any], progress_callback: ProgressCallback | None = None) -> dict[str, Any]:
+    """让模型对整份审核结果做总体总结（区别于逐条候选复核）。
+
+    AI 未启用或调用失败时返回 {}，展示层据此省略"AI 总体总结"节。
+    """
+    config = load_config()
+    if not (config.enabled and config.api_key):
+        return {}
+    if not config.summary_enabled:
+        LOGGER.info("ai_summary_skipped reason=AI_SUMMARY_ENABLED=false")
+        return {"status": "disabled", "reason": "AI_SUMMARY_ENABLED=false"}
+    try:
+        client = OpenAICompatibleClient(config)
+        model, _ = client.choose_model()
+        issues = [i for i in (result.get("issues") or []) if isinstance(i, dict)]
+        priority_counts: dict[str, int] = {}
+        rule_counts: dict[str, int] = {}
+        for issue in issues:
+            pr = str(issue.get("priority", ""))
+            if pr:
+                priority_counts[pr] = priority_counts.get(pr, 0) + 1
+            rid = str(issue.get("rule_id", ""))
+            if rid:
+                rule_counts[rid] = rule_counts.get(rid, 0) + 1
+        scope = result.get("scope_validation", {}) or {}
+        metrics = result.get("metrics", {}) or {}
+        ai_review = result.get("ai_review", {}) or {}
+        payload = {
+            "file": Path(str(result.get("source_file", ""))).name,
+            "conclusion": result.get("conclusion", ""),
+            "data_rows": result.get("data_rows"),
+            "issue_count": result.get("issue_count"),
+            "priority_counts": priority_counts,
+            "rule_top_counts": dict(sorted(rule_counts.items(), key=lambda kv: -kv[1])[:15]),
+            "metrics": {k: metrics.get(k) for k in (
+                "orphan_rows", "prefix_mismatch_rows", "converged_to_master_rows",
+                "self_ref_rows", "parent_longer_rows", "duplicate_groups",
+            ) if metrics.get(k) is not None},
+            "incremental_batch": bool(scope.get("incremental_batch")),
+            "external_parent_rows": scope.get("external_parent_rows", 0),
+            "ai_review": {
+                "candidate_count": ai_review.get("candidate_count", 0),
+                "reviewed_count": ai_review.get("reviewed_count", 0),
+            },
+        }
+        _emit_progress(progress_callback, {"phase": "ai", "stage": "summary_running", "status": "running", "percent": 93, "message": "AI 正在生成总体总结", "hint": f"模型：{model}"})
+        messages = [
+            {"role": "system", "content": (
+                "你是资深电厂 KKS 编码审核专家。基于程序化审核结果，撰写面向编码管理负责人的总体总结："
+                "overall 为 3-6 句中文总结（整体质量、主要风险、数据口径要点）；"
+                "points 为 3-5 条中文要点建议，每条一句话。只返回 JSON："
+                '{"overall":"...","points":["...","..."]}'
+            )},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        req = {"model": model, "messages": messages, "temperature": 0.2, "response_format": {"type": "json_object"}}
+        try:
+            response = client._request_json("chat/completions", req)
+        except AIReviewError as exc:
+            if "response_format" not in str(exc).lower() and "json_object" not in str(exc).lower():
+                raise
+            req.pop("response_format", None)
+            response = client._request_json("chat/completions", req)
+        content = str(((response.get("choices") or [{}])[0].get("message") or {}).get("content", ""))
+        decoded = json.loads(content)
+        if not isinstance(decoded, dict) or not str(decoded.get("overall", "")).strip():
+            raise AIReviewError("AI 总体总结返回格式异常")
+        points = [str(pt).strip() for pt in (decoded.get("points") or []) if str(pt).strip()]
+        LOGGER.info("ai_summary_done model=%s points=%s", model, len(points))
+        return {"overall": str(decoded["overall"]).strip(), "points": points, "model": model, "status": "completed"}
+    except Exception as exc:
+        LOGGER.error("ai_summary_failed error=%s", exc)
+        return {"status": "failed", "error": str(exc)[:200]}
+
+
+def summarize_ledger(ledger: list[dict[str, Any]], progress_callback: ProgressCallback | None = None) -> dict[str, Any]:
+    """跨文件趋势总结：基于审计台账（历次审核记录）归纳质量趋势与改进建议。
+
+    与 summarize_audit（单文件总体总结）互补——单文件总结回答"这一份怎么样"，
+    趋势总结回答"多份之间在往哪个方向走"。记录不足 2 条、AI 未启用或
+    AI_TREND_SUMMARY_ENABLED=false 时返回 {}，展示层据此省略该节。
+    """
+    entries = [e for e in (ledger or []) if isinstance(e, dict)]
+    if len(entries) < 2:
+        return {}
+    config = load_config()
+    if not (config.enabled and config.api_key):
+        return {}
+    if not config.trend_enabled:
+        LOGGER.info("ai_trend_skipped reason=AI_TREND_SUMMARY_ENABLED=false")
+        return {"status": "disabled", "reason": "AI_TREND_SUMMARY_ENABLED=false"}
+    try:
+        client = OpenAICompatibleClient(config)
+        model, _ = client.choose_model()
+        total_rows = sum(int(e.get("rows", 0) or 0) for e in entries)
+        total_issues = sum(int(e.get("issues", 0) or 0) for e in entries)
+        total_p0 = sum(int((e.get("priority") or {}).get("P0", 0) or 0) for e in entries)
+        total_p1 = sum(int((e.get("priority") or {}).get("P1", 0) or 0) for e in entries)
+        series = []
+        for e in entries[-30:]:  # 仅送最近 30 次，控制 token
+            rows = int(e.get("rows", 0) or 0)
+            issues = int(e.get("issues", 0) or 0)
+            series.append({
+                "ts": str(e.get("ts", "")),
+                "file": str(e.get("file", "")),
+                "rows": rows,
+                "issues": issues,
+                "rate": round(issues / rows * 100, 1) if rows else None,
+                "p0": int((e.get("priority") or {}).get("P0", 0) or 0),
+                "p1": int((e.get("priority") or {}).get("P1", 0) or 0),
+                "p2": int((e.get("priority") or {}).get("P2", 0) or 0),
+                "incremental": bool(e.get("incremental")),
+                "conclusion": str(e.get("conclusion", ""))[:120],
+            })
+        payload = {
+            "file_count": len(entries),
+            "total_rows": total_rows,
+            "total_issues": total_issues,
+            "avg_rate": round(total_issues / total_rows * 100, 2) if total_rows else None,
+            "total_p0": total_p0,
+            "total_p1": total_p1,
+            "series": series,
+        }
+        _emit_progress(progress_callback, {"phase": "ai", "stage": "trend_running", "status": "running", "percent": 96, "message": "AI 正在生成跨文件趋势总结", "hint": f"模型：{model}；累计 {len(entries)} 次审核"})
+        messages = [
+            {"role": "system", "content": (
+                "你是资深电厂 KKS 编码质量负责人。以下是多个批次/文件的 KKS 编码审核台账，"
+                "请做跨文件趋势总结，供编码管理负责人决策："
+                "overall 为 3-6 句中文（整体质量趋势、批次间变化、反复出现的系统性问题）；"
+                "points 为 3-5 条中文改进建议，每条一句话，指向管理动作而非具体某一行数据。"
+                "只返回 JSON：{\"overall\":\"...\",\"points\":[\"...\",\"...\"]}"
+            )},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+        req = {"model": model, "messages": messages, "temperature": 0.2, "response_format": {"type": "json_object"}}
+        try:
+            response = client._request_json("chat/completions", req)
+        except AIReviewError as exc:
+            if "response_format" not in str(exc).lower() and "json_object" not in str(exc).lower():
+                raise
+            req.pop("response_format", None)
+            response = client._request_json("chat/completions", req)
+        content = str(((response.get("choices") or [{}])[0].get("message") or {}).get("content", ""))
+        decoded = json.loads(content)
+        if not isinstance(decoded, dict) or not str(decoded.get("overall", "")).strip():
+            raise AIReviewError("AI 趋势总结返回格式异常")
+        points = [str(pt).strip() for pt in (decoded.get("points") or []) if str(pt).strip()]
+        LOGGER.info("ai_trend_done model=%s files=%s points=%s", model, len(entries), len(points))
+        return {
+            "overall": str(decoded["overall"]).strip(),
+            "points": points,
+            "model": model,
+            "status": "completed",
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "file_count": len(entries),
+        }
+    except Exception as exc:
+        LOGGER.error("ai_trend_failed error=%s", exc)
+        return {"status": "failed", "error": str(exc)[:200]}

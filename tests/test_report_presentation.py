@@ -43,7 +43,7 @@ class ReportPresentationTests(unittest.TestCase):
             "_ai_context": {"records": [{"kks_code": "01AAA10QM001"}, {"kks_code": "01AAA10QM001A"}]},
         }
 
-    def test_business_metrics_use_quality_groups(self):
+    def test_business_metrics_use_real_priority_counts(self):
         result = self.make_result()
         self.assertEqual(
             run_audit.quality_metrics(result),
@@ -57,18 +57,28 @@ class ReportPresentationTests(unittest.TestCase):
                 "p2": 1,
                 "rule_p1": 1,
                 "rule_p2": 1,
+                "focused_p1": 1,
+                "focused_p2": 1,
             },
         )
 
-    def test_problem_workbook_keeps_formal_and_hidden_ai_views(self):
+    def test_problem_workbook_uses_business_group_sheets(self):
         path = Path.cwd() / "outputs" / "test_report_presentation.xlsx"
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             run_audit.write_issue_workbook_xlsx(path, self.make_result())
             workbook = load_workbook(path, read_only=False, data_only=True)
-            self.assertEqual(list(workbook["问题清单"].iter_rows(min_row=1, max_row=1, values_only=True))[0], ("等级", "规则", "Excel 行号", "KKS", "问题", "整改建议"))
-            self.assertEqual(workbook["AI复核（技术）"].sheet_state, "hidden")
-            self.assertEqual(workbook["概览"]["A1"].value, "KKS 编码质量审核报告")
+            # 广元风格 sheet 结构：概览 + 按业务分组的明细 sheet + 结构说明
+            self.assertIn("概览", workbook.sheetnames)
+            self.assertIn("P0_阻断", workbook.sheetnames)
+            self.assertIn("P2_其他提示", workbook.sheetnames)
+            self.assertIn("结构说明与范围", workbook.sheetnames)
+            self.assertTrue(workbook["概览"]["A1"].value.startswith("sample 审核总览"))
+            # P0_阻断 sheet：第 3 行为表头、数据从第 4 行开始（与广元样式一致）
+            headers = [cell.value for cell in workbook["P0_阻断"][3]]
+            self.assertEqual(headers, ["行", "编码", "规则", "问题", "整改建议"])
+            first = [cell.value for cell in workbook["P0_阻断"][4]]
+            self.assertEqual(first, [2, "01AAA10QM0O1", "KKS-04b", "字符错误", "请核对后整改。"])
         finally:
             path.unlink(missing_ok=True)
 

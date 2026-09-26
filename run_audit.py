@@ -18,8 +18,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 import openpyxl
-from ai_review import review_issue_candidates
+from ai_review import review_issue_candidates, summarize_audit
+from audit_history import record_and_render
 from app_runtime import APP_ROOT, configure_logging
+from report_business import build_overview, render_html, render_xlsx
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -30,10 +32,19 @@ VERSION = "0.4.0"
 LOGGER = logging.getLogger("kks-audit")
 ProgressCallback = Callable[[dict[str, Any]], None]
 ROOT_PARENTS = {"", "-1"}
+# 10 版旧前缀历史参考（G=5/6/L/J 本身合法，迁移为项目约定，不再作为 P1 阻断）
 OLD_PREFIX = {"50": "05", "60": "06", "L0": "61", "J0": "61"}
-COMMON_UNITS = {"00", "61", "L0"}
-ALLOWED_CODE = re.compile(r"^[A-Z0-9\-/~]+$")
-NAME_UNIT = re.compile(r"([一二三四五六七八九十\d])\s*号\s*(机|炉|机组)")
+# 全厂码 G：公用取值（期别公用 J-R / 多期公用 S-V / 全厂公用 Y）
+COMMON_UNITS = {"J", "K", "L", "M", "N", "P", "Q", "R", "S", "T", "U", "V", "Y"}
+# 全厂码 G：自由使用字母
+FREE_UNIT_LETTERS = {"H", "W", "X", "Z"}
+# 全厂码 G：机组映射（1-9 → 1~9 号；A-G → 10~16 号）
+UNIT_LETTER_MAP = {"A": 10, "B": 11, "C": 12, "D": 13, "E": 14, "F": 15, "G": 16}
+# 企业惯例：20 版两位数字前缀（增量新增批次常用）——00=全厂公用 / 01=1号 / 02=2号 / 61=1,2号公用
+# 国标 G 表是单字符，但企业增量文件普遍以"两位数字前缀"标识机组/公用，按项目惯例视为合法。
+ENTERPRISE_UNIT_PREFIXES = {"00": "全厂公用", "01": "1号", "02": "2号", "61": "1,2号公用"}
+ALLOWED_CODE = re.compile(r"^[A-Z0-9-]+$")
+NAME_UNIT = re.compile(r"(\d{1,2}|[一二三四五六七八九十])\s*号\s*(机|炉|机组)")
 CN_NUM = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
 
 
@@ -81,28 +92,210 @@ def _report_issues(result: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+# ---------------------------------------------------------------- 问题分组树
+# 明细问题文本复用函数（HTML/Excel/Web 展示统一）
+_ACTION_LABELS = {
+    "confirmed_issue": "需整改",
+    "needs_human": "需确认",
+    "likely_false_positive": "建议抽查",
+}
+
+
+def action_label(item: dict[str, Any]) -> str:
+    """按 AI 复核结论给出问题处置动作标签（需整改/需确认/建议抽查/待确认）。"""
+    return _ACTION_LABELS.get(str(item.get("final_decision", "")), "待确认")
+
+
+def detail_text(item: dict[str, Any]) -> str:
+    """问题的具体描述（AI 复核后优先采用最终结论文本）。"""
+    return str(item.get("final_summary") or item.get("message") or item.get("category") or "待核问题")
+
+
+def suggestion_text(item: dict[str, Any]) -> str:
+    """问题的整改建议。"""
+    return str(item.get("final_suggestion") or item.get("suggestion") or "请结合原始 Excel 和业务资料确认。")
+
+
+def _excel_row_num(item: dict[str, Any]) -> int:
+    v = str(item.get("excel_row", "") or "").strip()
+    return int(v) if v.lstrip("-").isdigit() else 0
+
+
+def issue_rule_tree(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """把问题按「规则 → KKS → 行号明细」组织成展示树（HTML/Web 通用）。
+
+    返回轻量可序列化节点列表：
+      kind: "rule" | "code"；level 0/1
+      rule 节点: title=规则号  sub=问题定义  action=处置标签(需整改/需确认/建议抽查)
+                source=规则依据(文件名+章节)  children=该规则涉及的 KKS（去重，每个只出现一次）
+      code 节点: title=KKS 编码  sub=设备名  issues=行号明细(行号/问题描述/整改建议)
+    p0/p1/p2/count 为子树聚合计数。规则级属性上提到规则节点，明细行不再重复。
+    """
+    standard = str(result.get("standard", STANDARD_DEFAULT))
+    priority_order = {"P0": 0, "P1": 1, "P2": 2}
+    issues = sorted(
+        _report_issues(result),
+        key=lambda it: (
+            priority_order.get(str(it.get("priority")), 9),
+            str(it.get("rule_id", "")),
+            str(it.get("kks_code", "")),
+            _excel_row_num(it),
+        ),
+    )
+
+    rules: list[dict[str, Any]] = []
+    rule_index: dict[str, dict[str, Any]] = {}
+
+    def bump(node: dict[str, Any], pr: str) -> None:
+        if pr == "P0":
+            node["p0"] += 1
+        elif pr == "P1":
+            node["p1"] += 1
+        else:
+            node["p2"] += 1
+
+    for item in issues:
+        rid = str(item.get("rule_id") or "未编号规则")
+        pr = str(item.get("priority", "P2"))
+        rule = rule_index.get(rid)
+        if rule is None:
+            rule = {
+                "kind": "rule", "level": 0,
+                "title": rid,
+                "sub": str(item.get("definition") or item.get("category") or ""),
+                "note": "",
+                "action": action_label(item),
+                "source": rule_source(rid, standard),
+                "priority": pr,
+                "p0": 0, "p1": 0, "p2": 0, "count": 0,
+                "issues": [], "children": [],
+            }
+            rules.append(rule)
+            rule_index[rid] = rule
+
+        code = str(item.get("kks_code") or "").strip()
+        node: dict[str, Any] | None = None
+        for child in rule["children"]:  # 同一规则下编码数量有限，线性查找即可
+            if child["title"] == code:
+                node = child
+                break
+        if node is None:
+            node = {
+                "kind": "code", "level": 1,
+                "title": code or "未挂接编码的问题",
+                "sub": str(item.get("name") or ""),
+                "note": "",
+                "action": "", "source": "",
+                "priority": pr,
+                "p0": 0, "p1": 0, "p2": 0, "count": 0,
+                "issues": [], "children": [],
+            }
+            rule["children"].append(node)
+
+        node["issues"].append({
+            "priority": pr,
+            "rule_id": rid,
+            "kks_code": code,
+            "name": str(item.get("name") or ""),
+            "excel_row": item.get("excel_row", ""),
+            "message": detail_text(item),
+            "suggestion": suggestion_text(item),
+            "status": item.get("status", ""),
+            "ai_decision": item.get("ai_decision", ""),
+        })
+        bump(rule, pr)
+        bump(node, pr)
+        rule["count"] += 1
+        node["count"] += 1
+
+    for rule in rules:
+        rule["note"] = f"{len(rule['children'])} 个编码 · {rule['count']} 条"
+        for node in rule["children"]:
+            node["note"] = f"{node['count']} 条"
+    return rules
+
+
+def rule_tree_html(nodes: list[dict[str, Any]]) -> str:
+    """把 issue_rule_tree 的分组树渲染为 <details> 折叠 HTML。
+
+    规则节点默认展开（呈现该规则涉及的 KKS 清单）；KKS 节点默认收起，
+    点击展开后才显示行号明细——默认页面短，且规则字段/KKS 不再重复出现。
+    """
+    parts = []
+    for node in nodes:
+        kind = node.get("kind")
+        title = html.escape(str(node.get("title") or ""))
+        sub = html.escape(str(node.get("sub") or ""))
+        note = html.escape(str(node.get("note") or ""))
+        badge = "".join(
+            f"<span class='tb tb-p{c}'>{node.get('p' + c, 0)}</span>"
+            for c in ("0", "1", "2") if node.get("p" + c, 0)
+        )
+        if kind == "code":
+            rows = node.get("issues") or []
+            summary = (
+                f"<span class='it-name'>{title or '未挂接编码的问题'}</span>"
+                + (f"<span class='it-title'>{sub}</span>" if sub else "")
+                + f"<span class='it-count'>{note}</span>{badge}"
+            )
+            inner = ""
+            if rows:
+                inner = "<div class='it-issues'>" + "".join(
+                    f"<div class='it-issue'><span class='it-row'>行号 {html.escape(str(row.get('excel_row', '') or '—'))}</span>"
+                    f"<span class='it-msg'>{html.escape(str(row.get('message') or '待核问题'))}</span>"
+                    f"<div class='it-suggest'>建议：{html.escape(str(row.get('suggestion') or ''))}</div></div>"
+                    for row in rows
+                ) + "</div>"
+            parts.append(f"<details class='it-node it-code'><summary>{summary}</summary>{inner}</details>")
+            continue
+
+        # 规则节点：P 徽标 + 规则号 + 问题定义 + 处置标签 + 计数；展开出 KKS 清单
+        p = node.get("priority", "P2")
+        act = html.escape(str(node.get("action") or "待确认"))
+        act_cls = {"需整改": "act-fix", "需确认": "act-hm"}.get(str(node.get("action")), "act-ck")
+        src = html.escape(str(node.get("source") or ""))
+        summary = (
+            f"<span class='priority p{str(p)[-1]}'>{html.escape(str(p))}</span>"
+            f"<span class='it-name tg-rid'>{title}</span>"
+            f"<span class='tg-def'>{sub}</span>"
+            f"<span class='tg-act {act_cls}'>{act}</span>"
+            f"<span class='it-count'>{note}</span>"
+        )
+        kids = rule_tree_html(node.get("children") or [])
+        src_html = f"<div class='tg-src'>规则依据：{src}</div>" if src else ""
+        parts.append(
+            f"<details class='it-node tg-rule' open><summary>{summary}</summary>{src_html}"
+            f"<div class='it-kids'>{kids}</div></details>"
+        )
+    return "".join(parts)
+
+
+
+
+
 def quality_metrics(result: dict[str, Any]) -> dict[str, int]:
-    """Return business-facing quality metrics used by the report and UI."""
+    """Return business-facing quality metrics used by the report and UI.
+
+    P0/P1/P2 均为真实规则级计数（与详细问题清单自洽）。
+    另保留两个业务治理重点的聚焦计数（扩展码治理 KKS-17/22、历史迁移 KKS-18）
+    供报告明细作为治理提示，不作为首页大数字口径。
+    """
     records = result.get("_ai_context", {}).get("records", [])
     codes = [text(item.get("kks_code")) for item in records if isinstance(item, dict)]
     metrics = result.get("metrics", {})
     priority_counts = Counter(item.get("priority", "P2") for item in _report_issues(result))
-    # The landing-page P1/P2 figures are the two business-critical governance
-    # groups requested for delivery: extension-code governance and historical
-    # migration. The complete rule-level distribution remains in the detail
-    # list and the technical coverage sheet.
-    focused_p1 = _rule_issue_count(result, {"KKS-17", "KKS-22"})
-    focused_p2 = _rule_issue_count(result, {"KKS-18"})
     return {
         "effective_kks": int(result.get("data_rows", len(codes)) or 0),
         "device_level_codes": sum(1 for code in codes if len(code) == 12),
         "duplicate_codes": int(metrics.get("duplicate_code_groups", 0) or 0),
         "parent_errors": int(metrics.get("orphan_rows", 0) or 0) + int(metrics.get("prefix_mismatch_rows", 0) or 0),
         "p0": int(priority_counts.get("P0", 0)),
-        "p1": int(focused_p1),
-        "p2": int(focused_p2),
+        "p1": int(priority_counts.get("P1", 0)),
+        "p2": int(priority_counts.get("P2", 0)),
         "rule_p1": int(priority_counts.get("P1", 0)),
         "rule_p2": int(priority_counts.get("P2", 0)),
+        "focused_p1": _rule_issue_count(result, {"KKS-17", "KKS-22"}),
+        "focused_p2": _rule_issue_count(result, {"KKS-18"}),
     }
 
 
@@ -189,6 +382,153 @@ def _load_executable_skill_rules():
 SKILL_RULES = _load_executable_skill_rules()
 SKILL_RULE_SOURCE = "kks-audit/SKILL.md"
 
+# 规则问题定义表：每条审核规则的一句话定义（判定语义）。
+# 由 references/KKS编码审核标准检查清单.md 的"校验原理"提炼，
+# 作为 HTML 报告 / Excel 问题清单 / Web 预览"问题定义"列的统一数据源。
+RULE_DEFINITIONS: dict[str, str] = {
+    "KKS-00": "数据行缺少 KKS 编码：非空记录应含设备 KKS 码，缺失则无法入库定位。",
+    "KKS-01": "多 Sheet 定位主表：应区分主表与导出/草稿表，防止重复或漏审。",
+    "KKS-02": "表头与数据起始行定位：表头不总在第 1 行，错读将导致整列错位。",
+    "KKS-03": "关键列动态定位：按表头名匹配 KKS/父级/名称/类型列，不依赖固定列序。",
+    "KKS-04": "字符合法性：仅允许大写字母 A-Z、数字 0-9 与分隔符 -；小写、中文、全角及 ~、/ 等未定义字符判非法。",
+    "KKS-04b": "分段字符类型校验：12 位骨架逐段定类型——G/F1F2F3/A1A2 为字母段，F0/FN/AN 为数字段，数字段出现字母或字母段出现数字即错。",
+    "KKS-05": "编码长度合规：设备级 12 位、系统级 5/6/7 位、根节点 1 位；超过 12 位不立即判错，转编码深度定性。",
+    "KKS-06": "结构位取值合规：全厂码 G 须在 1-9/A-G/J-R/S-V/Y 或自由字母 H/W/X/Z 取值内；编码不得含 I/O 等易混字母。",
+    "KKS-07": "重复 KKS 码：主键须唯一；区分位置后缀丢失（可机械修复）与异设备真碰撞（须人工重编）。",
+    "KKS-08": "父级参照完整性：非根节点父级码须作为某行真实存在，否则层级断链、破坏外键。",
+    "KKS-09": "子码前缀一致性：子码须以父码为前缀（结合父级列值判定，不按固定位数截取推导）。",
+    "KKS-10": "自引用/环检测：父级不得指向自身，编码树不得形成闭合环。",
+    "KKS-11": "父级长度约束：父码长度应小于子码（父码应是子码的短前缀）。",
+    "KKS-12": "根节点哨兵：根节点父级应为空或 -1，不得指向不存在的编码。",
+    "KKS-13/16": "旧前缀迁移提示：50/60/L0/J0 等旧前缀编码仅作历史提示，需人工核对是否迁移遗漏。",
+    "KKS-14": "字母重分配：系统/设备类型字母变更应在重分配映射表内，避免随意改字母导致语义漂移。",
+    "KKS-15": "层级重排：版本间同一设备的层级位置调整，须人工核验语义未变。",
+    "KKS-16": "旧码遗留：父级或个别码仍命中旧前缀表，提示核对是否为历史遗留。",
+    "KKS-17/22": "12 位以上扩展码定性：区分纯 DCS 点号（-KF）、部件级附加码（-XXnn）与电气 A/B/C 分相，评估导入方式。",
+    "KKS-18": "旧→新码语义一致：迁移后设备语义应与原码对应，避免码变设备不对。",
+    "KKS-19/20/21": "跨厂/范围对比：专业覆盖差异、编码深度差异与数量瀑布分解闭合。",
+    "KKS-22": "码长与导入结构：超过 12 位的编码无法原样套用 LOCATIONS 结构，需扩展表/分层承载。",
+    "KKS-23": "两票/缺陷历史兼容：纸质票面已打印的历史 KKS 不可改写，采用映射层+双码共存+冻结历史。",
+    "KKS-24": "命名模糊/歧义：名称省略关键限定词致多解（如 1号2号高加3号液位计），需补全机组/位置限定。",
+    "KKS-25": "同设备异码：同一物理设备被编了多个 KKS 码，按归一名称聚类提示人工确认。",
+    "KKS-25b": "同物异名候选：名称风格不一（如 电机/电动机/马达）聚簇出的高可疑对，仅供人工抽检。",
+    "KKS-25c": "结构身份键一对多：同一旧码对应多个不同新码，疑似真重复，须人工裁定。",
+    "KKS-26": "应编未编：父设备按惯例应含可独立标识的子部件（隔离点/回路/执行机构）却缺失。",
+    "KKS-27": "名称文本卫生与语义可解性：名称含非常规符号/控制符判脏；提取不到任何已知设备名词判语义需人核。",
+    "KKS-28": "机组三方一致：机组列、名称中的机组指代、全厂码 G 三方须一致；公用/自由字母跳过不误报。",
+    "KKS-29": "OCR 易混字符待核：编码含 I/i/L/l/O/o 等易混字符，人工核对是否为数字 1/0 的识别错误。",
+    "KKS-30": "文本卫生：码与名称的首尾空白、换行、制表符、全角空格等脏数据，标记并附清洗。",
+    "KKS-31": "父子名称语义一致性：直接父子一级、同类设备的名称标识 token 应一致，矛盾即报。",
+    "KKS-A": "名称语义与设备字母一致：名称含泵/阀等词应对应泵类/阀类字母，不符即名实疑点。",
+    "KKS-C": "命名风格归一：1号机/1#机/#1机/一号机 等风格混用，提示统一风格。",
+    "KKS-D": "空/缺名称：名称列为空、-、无、None 等，设为必填字段时按 P0 阻断。",
+    "KKS-E": "设备类型列与名称一致：类型列值（如 截止阀）与名称推导类型（如 闸阀）矛盾。",
+    "KKS-F": "同父级编号断号：同父设备编号序列缺号（001/002/004），可能漏编。",
+    "KKS-G": "字母组合合法性：系统字母与设备字母的标准配对校验。",
+}
+
+
+# ---- 规则依据出处（word 标准文档 · 文件 + 章节）----
+# 三份依据文档（2026-09-02 从 doc/docx 原始文件提取核对）：
+#   火电导则：电力火电厂标识系统（KKS）编码导则-0813（.doc）
+#   风电规范：中国电力投资集团公司风电场标识系统（KKS）编码规范 CPI（.docx）
+#   光伏规范：中国电力投资集团公司光伏发电站标识系统（KKS）编码规范 CPI（.docx）
+# RULE_SOURCES 值为"文件短名 + 条款号（表号）"，直接用于 HTML/Excel/Web"规则依据"列。
+# 编码规范无明文章节的工程/数据质量类规则统一为通用说明，不虚构条款。
+STANDARD_DEFAULT = "huodian"
+STANDARD_NAMES = {"huodian": "火电导则", "wind": "风电规范", "solar": "光伏规范"}
+# 与 国标/ 目录磁盘文件一一对应的完整文档名（展示时直接可对上文件名）
+STANDARD_FILES = {
+    "huodian": "电力火电厂标识系统（KKS）编码导则-0813",
+    "wind": "中国电力投资集团公司风电场标识系统（KKS）编码规范",
+    "solar": "中国电力投资集团公司光伏发电站标识系统（KKS）编码规范",
+}
+# 报告头"规则依据体系"行：完整磁盘文件名（含序号前缀与扩展名，可直接在 国标/ 目录找到）
+STANDARD_FULL = {
+    "huodian": "国标/电力火电厂标识系统（KKS）编码导则-0813.doc（火电导则）",
+    "wind": "国标/3.中国电力投资集团公司风电场标识系统（KKS）编码规范.docx（风电规范）",
+    "solar": "国标/4.中国电力投资集团公司光伏发电站标识系统（KKS）编码规范.docx（光伏规范）",
+}
+GENERIC_SOURCE = "通用审计要求，无专条依据"
+_ST_STRUCT = ("火电导则 5.1.3 KKS编码构成（字符类型 N/A，禁用 I/O）", "风电规范 4.1 编码构成（字符类型 N/A，禁用 I/O）", "光伏规范 4.1 编码构成（字符类型 N/A，禁用 I/O）")
+_ST_SEG = ("火电导则 5.2.1~5.2.3 码段结构（F0/F1F2F3/FN/A1A2/AN）", "风电规范 4.2.1~4.2.3 码段结构", "光伏规范 4.2.1~4.2.3 码段结构")
+_ST_G = ("火电导则 5.1.4 全厂标识（表2）", "风电规范 4.1 全厂码（表1）", "光伏规范 4.1 全厂码（表1）")
+_ST_UNIQ = ("火电导则 3 术语和定义·标识（唯一记号）", "风电规范 3 定义与术语·标识（唯一记号）", "光伏规范 3 定义与术语·标识（唯一记号）")
+_ST_DEV = ("火电导则 6.2 设备索引（表29~37）", "风电规范 5.2 设备索引（表18~24）", "光伏规范 5.2 设备索引（表19~24）")
+_ST_PART = ("火电导则 5.2.3 部件码", "风电规范 4.2.3 部件码", "光伏规范 4.2.3 部件码")
+_ST_COMBO = ("火电导则 6.1+6.2 系统/设备索引", "风电规范 5.1+5.2 系统/设备索引", "光伏规范 5.1+5.2 系统/设备索引")
+
+RULE_SOURCES: dict[str, dict[str, str]] = {}
+for _rid, _vals in {
+    "KKS-04": _ST_STRUCT, "KKS-04b": _ST_SEG, "KKS-05": _ST_STRUCT,
+    "KKS-06": _ST_G, "KKS-07": _ST_UNIQ,
+    "KKS-08": _ST_STRUCT, "KKS-09": _ST_STRUCT, "KKS-10": _ST_STRUCT,
+    "KKS-11": _ST_STRUCT, "KKS-12": _ST_STRUCT,
+    "KKS-25": _ST_UNIQ, "KKS-25c": _ST_UNIQ, "KKS-26": _ST_PART,
+    "KKS-28": _ST_G, "KKS-29": _ST_STRUCT,
+    "KKS-A": _ST_DEV, "KKS-G": _ST_COMBO,
+}.items():
+    RULE_SOURCES[_rid] = dict(zip(("huodian", "wind", "solar"), _vals))
+# 出处列展示为"完整文件名 + 条款"，把元组中的短名前缀替换成 STANDARD_FILES 全名
+for _rid, _tbl in RULE_SOURCES.items():
+    for _std, _short in STANDARD_NAMES.items():
+        _full = STANDARD_FILES[_std]
+        _tbl[_std] = _tbl[_std].replace(_short, _full, 1)
+
+
+def rule_source(rule_id: str, standard: str) -> str:
+    """按审核标准体系取规则出处；支持组键回退（如 KKS-13 命中 KKS-13/16）。"""
+    table = RULE_SOURCES.get(rule_id)
+    if not table:
+        table = next((v for k, v in RULE_SOURCES.items() if rule_id in k.split("/")), None)
+    if not table:
+        return GENERIC_SOURCE
+    return table.get(standard) or table.get(STANDARD_DEFAULT) or GENERIC_SOURCE
+
+
+def detect_standard(records: list[dict[str, Any]]) -> str:
+    """按数据内容推断适用的标准文档体系：火电导则/风电规范/光伏规范。
+
+    依据两类信号打分：
+      1) KKS 码系统分类字母（第 3 位 F1）——对照三份文档的系统索引字母表；
+      2) 设备名称特征词（用无歧义词，如"锅炉/汽轮机"vs"风电机组"vs"光伏/汇流箱"，
+         单字"风机"不采用，暖通风机会误判为风电）。
+    平分或全 0 时回退火电导则（当前主要业务口径）。
+    """
+    huodian_w = ("锅炉", "汽轮机", "汽机", "磨煤机", "给水泵", "凝汽器", "除氧器", "暖通", "热网", "送风机", "引风机", "主蒸汽", "再热器")
+    wind_w = ("风电机组", "风力发电", "轮毂", "塔筒", "机舱", "桨叶")
+    solar_w = ("光伏", "逆变器", "汇流箱", "方阵", "太阳能", "光伏组件")
+    score = {"huodian": 0, "wind": 0, "solar": 0}
+    f1_letters: set[str] = set()
+    seen = 0
+    for rec in records:
+        if seen >= 800:
+            break
+        code = text(rec.get("kks_code"))
+        name = text(rec.get("name"))
+        seen += 1
+        if len(code) >= 6 and code[2].isalpha():
+            f1_letters.add(code[2].upper())
+        for kw in huodian_w:
+            if kw in name:
+                score["huodian"] += 2
+                break
+        for kw in wind_w:
+            if kw in name:
+                score["wind"] += 2
+                break
+        for kw in solar_w:
+            if kw in name:
+                score["solar"] += 2
+                break
+    if "W" in f1_letters:
+        score["solar"] += 2
+    for ch in ("H", "L", "X"):
+        if ch in f1_letters:
+            score["huodian"] += 1
+    best = max(score, key=lambda k: (score[k], k != STANDARD_DEFAULT))
+    return best if score[best] else STANDARD_DEFAULT
+
 
 def text(value: Any) -> str:
     if value is None:
@@ -239,6 +579,9 @@ def find_column(header: tuple[Any, ...], kind: str) -> int | None:
         return first(lambda s: "设备类型" in s or s == "类型")
     if kind == "profession":
         return first(lambda s: "专业" in s or "所属专业" in s)
+    if kind == "system":
+        # 系统/系统名称列（工艺系统归属，用于报告表格的"系统"列展示）
+        return first(lambda s: "系统" in s and not any(x in s for x in ("KKS", "编码", "设备", "上级", "父级", "字母", "名称表")))
     return None
 
 
@@ -292,6 +635,8 @@ def make_record(excel_row: int, row: tuple[Any, ...], cols: dict[str, int | None
         "name": get("name"),
         "unit": get("unit"),
         "device_type": get("dtype"),
+        "profession": get("profession"),
+        "system": get("system"),
         "raw_name": str(row[cols["name"]]) if cols.get("name") is not None and row[cols["name"]] is not None else "",
         "raw_kks": str(row[cols["kks"]]) if cols.get("kks") is not None and row[cols["kks"]] is not None else "",
     }
@@ -306,24 +651,69 @@ def add_issue(issues: list[dict[str, Any]], *, priority: str, rule_id: str, cate
         "status": status,
         "rule_id": rule_id,
         "category": category,
+        "definition": RULE_DEFINITIONS.get(rule_id, ""),
         "excel_row": rec.get("excel_row", ""),
         "kks_code": rec.get("kks_code", ""),
         "parent_code": rec.get("parent_code", ""),
         "old_code": rec.get("old_code", ""),
         "name": rec.get("name", ""),
+        "unit": rec.get("unit", ""),
+        "profession": rec.get("profession", ""),
+        "system": rec.get("system", ""),
         "message": message,
         "suggestion": suggestion,
         "evidence": evidence,
     })
 
 
-def code_unit(prefix: str, common_units: set[str] | None = None) -> int | None:
-    if prefix in (common_units or COMMON_UNITS):
+def code_unit(g_char: str, common_units: set[str] | None = None) -> int | None:
+    """全厂码 G（1 位）→ 机组号。
+
+    - 1~9 → 1~9 号机组；A~G → 10~16 号机组
+    - J~R/S~V/Y（公用）与 H/W/X/Z（自由使用）→ None（跳过，不误报）
+    - 其他取值（0、I/O、数字外字符）→ None（由 G 取值合规检查另行报错）
+    """
+    if not g_char:
         return None
-    if prefix.isdigit():
-        value = int(prefix)
-        return value if 1 <= value <= 12 else None
-    return None
+    if g_char in (common_units or COMMON_UNITS):
+        return None
+    if g_char in FREE_UNIT_LETTERS:
+        return None
+    if g_char.isdigit():
+        value = int(g_char)
+        return value if 1 <= value <= 9 else None
+    return UNIT_LETTER_MAP.get(g_char.upper())
+
+
+def valid_g_char(g_char: str) -> bool:
+    """全厂码 G 合法取值：1-9 / A-G / J-R / S-V / Y / 自由字母 H/W/X/Z。
+
+    注：企业惯例（两位数字前缀 00/01/02/61）不在此处判定，由
+    ``enterprise_unit_ok`` 在编码级判断，避免把 G='0'/'6' 当非法。
+    """
+    if not g_char:
+        return False
+    if g_char.isdigit():
+        return 1 <= int(g_char) <= 9
+    return g_char.upper() in (set(UNIT_LETTER_MAP) | COMMON_UNITS | FREE_UNIT_LETTERS)
+
+
+def enterprise_unit_ok(code: str, enterprise_prefixes: dict[str, str] | None = None) -> bool:
+    """企业惯例校验：编码前两位命中企业前缀表（00/01/02/61…）视为合法。"""
+    table = enterprise_prefixes or ENTERPRISE_UNIT_PREFIXES
+    return len(code) >= 2 and code[:2] in table
+
+
+def enterprise_mode(code_prefixes: set[str]) -> bool:
+    """判定本次文件是否采用企业两位数字前缀惯例。
+
+    依据：编码前两位命中企业表的行占比 ≥ 80%（对 12 位设备码而言，
+    00/01/02/61 是企业机组/公用的确定性信号）。
+    """
+    if not code_prefixes:
+        return False
+    hits = sum(1 for p in code_prefixes if len(p) >= 2 and p[:2] in ENTERPRISE_UNIT_PREFIXES)
+    return hits / len(code_prefixes) >= 0.8
 
 
 def classify_extension(code: str) -> str:
@@ -335,8 +725,6 @@ def classify_extension(code: str) -> str:
         return "A/B 位置扩展"
     if len(code) == 13 and code[-1] in "C":
         return "末位 A/B/C 扩展"
-    if "~" in code:
-        return "区间设备组"
     return "其他超长码"
 
 
@@ -355,7 +743,7 @@ def summarize_scope(input_path: Path) -> dict[str, Any]:
     wb = openpyxl.load_workbook(input_path, read_only=True, data_only=True)
     sheet, rows, header_idx = choose_sheet(wb, None)
     header = rows[header_idx]
-    cols = {kind: find_column(header, kind) for kind in ("kks", "old", "parent", "name", "unit", "dtype", "profession")}
+    cols = {kind: find_column(header, kind) for kind in ("kks", "old", "parent", "name", "unit", "dtype", "profession", "system")}
     if cols["kks"] is None:
         raise ValueError(f"对比文件主表缺少 KKS 码列：{input_path.name}")
     records: list[dict[str, Any]] = []
@@ -541,15 +929,17 @@ def _apply_template_skill_rules(
         )
     diagnostics["executed_rules"].append("KKS-24")
 
+    # 同名多码：按聚簇"每条一组"上报（不再按簇内每个编码逐条报），
+    # 避免同一簇被重复计数成 N 条把清单撑爆；组内全部编码在消息中列出。
     for system_key, normalized_name, codes in rules.near_dup_by_name(template_cols, template_rows):
-        for code in codes:
-            index = next((i for i, rec in records_by_index.items() if rec.get("kks_code") == code), None)
-            _append_skill_issue(
-                issues, seen, records_by_index, rule_id="KKS-25", priority="P1", category="归一名称对应多个 KKS 码", index=index,
-                message=f"同一系统 {system_key} 内，归一名称 {normalized_name!r} 对应多个编码：{', '.join(codes)}。",
-                suggestion="仅作为人工抽检线索；结合原KKS/设计编码、位置和图纸证据确认，不自动合并。",
-                status="needs_review", evidence=f"系统前9位={system_key}；编码={codes}",
-            )
+        index = next((i for i, rec in records_by_index.items() if rec.get("kks_code") == codes[0]), None)
+        shown = ", ".join(codes[:6]) + ("…" if len(codes) > 6 else "")
+        _append_skill_issue(
+            issues, seen, records_by_index, rule_id="KKS-25", priority="P1", category="同名对应多个 KKS 码", index=index,
+            message=f"同一系统 {system_key} 内，归一名称 {normalized_name!r} 对应 {len(codes)} 个编码：{shown}。",
+            suggestion="仅作为人工抽检线索；结合原KKS/设计编码、位置和图纸证据确认，不自动合并。",
+            status="needs_review", evidence=f"系统前9位={system_key}；编码数={len(codes)}",
+        )
     diagnostics["executed_rules"].append("KKS-25")
 
     semantic_candidates = rules.semantic_dup_by_name(template_cols, template_rows)
@@ -565,14 +955,16 @@ def _apply_template_skill_rules(
 
     for identity_key, items in rules.identity_dup_by_key(template_cols, template_rows):
         codes = sorted({item[1] for item in items})
-        for _, code, name in items:
-            index = next((i for i, rec in records_by_index.items() if rec.get("kks_code") == code), None)
-            _append_skill_issue(
-                issues, seen, records_by_index, rule_id="KKS-25c", priority="P1", category="结构身份键一对多", index=index,
-                message=f"1:1 身份键 {identity_key!r} 对应多个新码：{', '.join(codes)}。",
-                suggestion="以原KKS/旧版设计编码作为身份键人工裁定，不自动合并。",
-                evidence=f"身份键={identity_key}; 名称={name}",
-            )
+        first_code = codes[0]
+        index = next((i for i, rec in records_by_index.items() if rec.get("kks_code") == first_code), None)
+        names = sorted({item[2] for item in items if item[2]})
+        shown = ", ".join(codes[:6]) + ("…" if len(codes) > 6 else "")
+        _append_skill_issue(
+            issues, seen, records_by_index, rule_id="KKS-25c", priority="P1", category="原KKS一对多", index=index,
+            message=f"原KKS {identity_key!r} 对应 {len(codes)} 个新码：{shown}。",
+            suggestion="以原KKS/旧版设计编码作为 1:1 身份键人工裁定，不自动合并。",
+            evidence=f"身份键={identity_key}; 名称={'/'.join(names[:4])}",
+        )
     diagnostics["executed_rules"].append("KKS-25c")
 
     for parent_code, parent_name, parent_type, expected in rules.expected_missing(template_cols, template_rows):
@@ -645,17 +1037,18 @@ def _apply_template_skill_rules(
     return diagnostics
 
 
+# 设备索引字母（A 码）——10 版 VGB 旧字母（QM/MA/BT/FT/LS 等）不再用于名实一致性判定
 DEVICE_LETTER_SEMANTICS = {
-    "泵": {"BG", "AP", "CP"},
-    "阀": {"QM", "AA"},
-    "门": {"QM", "AA"},
-    "执行机构": {"MA", "CA"},
-    "测温": {"BT"},
-    "温度": {"BT"},
-    "流量": {"BW", "FT"},
-    "液位": {"LS"},
-    "给煤机": {"GL"},
-    "压缩机": {"CM"},
+    "泵": {"AP", "BN"},
+    "阀": {"AA"},
+    "门": {"AA", "AB"},
+    "执行机构": {"AS"},
+    "测温": {"CT"},
+    "温度": {"CT"},
+    "流量": {"CF"},
+    "液位": {"CL"},
+    "风机": {"AN"},
+    "压缩机": {"AN"},
 }
 KNOWN_DEVICE_LETTERS = set().union(*DEVICE_LETTER_SEMANTICS.values())
 NAME_CONTEXT_TERMS = ("管道", "系统", "水室", "用汽", "冷却水", "油处理")
@@ -771,14 +1164,15 @@ def _apply_additional_skill_rules(
     migration = config.get("letter_reallocations", {}) if isinstance(config.get("letter_reallocations"), dict) else {}
     system_map = migration.get("system", {}) if isinstance(migration.get("system"), dict) else {}
     device_map = migration.get("device", {}) if isinstance(migration.get("device"), dict) else {}
+    converged_old_lens: Counter[int] = Counter()
     for index, rec in records_by_index.items():
         old, new = rec.get("old_code", ""), rec.get("kks_code", "")
         if not old or not new:
             continue
         if old[:2] in old_prefix_migrations and new[:2] != old_prefix_migrations[old[:2]]:
             _append_skill_issue(
-                issues, seen, records_by_index, rule_id="KKS-16", priority="P1", category="旧格式码未正确迁移", index=index,
-                message=f"原码/新码前缀迁移疑点：{old[:2]} → {new[:2]}。", suggestion="核对 10 版→20 版迁移表，不直接覆盖历史码。",
+                issues, seen, records_by_index, rule_id="KKS-16", priority="P2", category="旧版前缀历史提示", index=index,
+                message=f"原码/新码前缀命中 10 版旧前缀表：{old[:2]} → {new[:2]}。", suggestion="编码体系不定义版本迁移；如属项目约定请核对迁移表，历史原码保留。", status="needs_review",
             )
         if old[2:5] in system_map and system_map[old[2:5]] != new[2:5]:
             _append_skill_issue(
@@ -791,10 +1185,16 @@ def _apply_additional_skill_rules(
                 message=f"设备字母应按配置从 {old[7:9]} 映射为 {device_map[old[7:9]]}，当前为 {new[7:9]}。", suggestion="核对版本迁移字母表和设备语义。",
             )
         if len(old) != len(new):
+            # 扩展码/旧码 → 12 位主码的"收敛"是增量新增/标准化业务本身（本次文件的
+            # 新旧长度差异绝大多数源于此），不逐条报 P1；改计聚合数供"范围与结构说明"引用。
+            if len(new) == 12 and len(old) != 12:
+                converged_old_lens[len(old)] += 1
+                continue
             _append_skill_issue(
                 issues, seen, records_by_index, rule_id="KKS-15", priority="P1", category="层级位置变化需人工核", index=index,
-                message=f"原码长度 {len(old)} 与新码长度 {len(new)} 不同，存在层级重排或扩展建模变化。", suggestion="结合设备语义确认层级是否重排，不自动判为错误。", status="needs_review",
+                message=f"原码长度 {len(old)} 与新码长度 {len(new)} 不同，且新码不是 12 位主码，存在层级重排或扩展建模变化。", suggestion="结合设备语义确认层级是否重排，不自动判为错误。", status="needs_review",
             )
+    diagnostics["converged_to_master_old_len"] = dict(sorted(converged_old_lens.items()))
     diagnostics["executed_rules"].extend(["KKS-14", "KKS-15", "KKS-16"])
     return diagnostics
 
@@ -840,6 +1240,7 @@ def apply_ai_review_stage(
 ) -> dict[str, Any]:
     """Run the optional semantic stage and update the audit conclusion."""
     result["ai_review"] = review_issue_candidates(result, progress_callback=progress_callback)
+    result["ai_summary"] = summarize_audit(result, progress_callback=progress_callback)
     result["final_decision_counts"] = final_decision_counts(result)
     final_counts = result["final_decision_counts"]
     final_actionable = final_counts.get("confirmed_issue", 0) + final_counts.get("needs_human", 0)
@@ -867,8 +1268,15 @@ def write_audit_artifacts(
     _emit_progress(progress_callback, {"phase": "audit", "stage": "report", "percent": 95, "message": "正在生成审核报告", "hint": "整理 HTML 报告和问题 Excel"})
     output_dir.mkdir(parents=True, exist_ok=True)
     html_name, xlsx_name = output_artifact_names(input_path)
-    write_html(output_dir / html_name, result)
-    write_issue_workbook_xlsx(output_dir / xlsx_name, result)
+    overview = build_overview(result)
+    write_html(output_dir / html_name, result, overview)
+    write_issue_workbook_xlsx(output_dir / xlsx_name, result, overview)
+    # 审计台账：追加本次记录并更新跨文件汇总报告（含 AI 趋势总结）
+    try:
+        summary_path = record_and_render(input_path, output_dir, result, progress_callback=progress_callback)
+        result["history_summary"] = str(summary_path)
+    except Exception as exc:  # 台账失败不阻断主流程
+        LOGGER.warning("audit_history_record_failed error=%s", exc)
     LOGGER.info(
         "audit_done file=%s rows=%s issues=%s ai_status=%s ai_reviewed=%s",
         input_path.name,
@@ -907,7 +1315,7 @@ def audit_tree_collection(
     child_groups: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
     relation_counts: Counter[str] = Counter()
     missing_child = 0
-    accepted_lengths = {2, 3, 4, 5, 7, 12, 13}
+    accepted_lengths = {1, 3, 4, 5, 6, 7, 11, 12, 13, 16, 17}
 
     def normalized(code: str) -> str:
         return code.replace("O", "0").replace("o", "0").replace("I", "1").replace("i", "1")
@@ -934,10 +1342,16 @@ def audit_tree_collection(
         if len(child_code) not in accepted_lengths:
             add_issue(issues, priority="P0", rule_id="KKS-05", category="编码长度异常", rec=rec, message=f"子设备编码长度为 {len(child_code)}，不在已识别范围内。", suggestion="核对变长层级或扩展建模。")
         if len(child_code) >= 12:
-            for start, end, label in ((0, 2, "机组位"), (2, 5, "系统字母"), (5, 7, "系统编号"), (7, 9, "设备字母"), (9, 12, "设备顺序号")):
+            for start, end, label, want in ((0, 1, "全厂码G", "ALNUM"), (1, 2, "系统前缀号F0", "DIGIT"), (2, 5, "系统分类码F1F2F3", "ALPHA"),
+                                            (5, 7, "系统编号FN", "DIGIT"), (7, 9, "设备分类码A1A2", "ALPHA"), (9, 12, "设备编号AN", "DIGIT")):
                 part = child_code[start:end]
-                should_digit = label in {"机组位", "系统编号", "设备顺序号"}
-                if (part.isdigit() if should_digit else part.isalpha()) is False:
+                if want == "ALNUM":
+                    ok = part.isalnum()
+                elif want == "DIGIT":
+                    ok = part.isdigit()
+                else:
+                    ok = part.isalpha()
+                if not ok:
                     add_issue(issues, priority="P0", rule_id="KKS-04b", category="分段字符类型错误", rec=rec, message=f"{label}片段 {part!r} 含错误字符。", suggestion="按同层兄弟码和图纸人工确认修正值。")
                     break
             if any(char in child_code for char in "IiOo"):
@@ -968,6 +1382,7 @@ def audit_tree_collection(
         if len(group) > 1:
             for rec in group:
                 add_issue(issues, priority="P0", rule_id="KKS-07", category="重复子设备 KKS 码", rec=rec, message=f"子设备 KKS 码 {code} 在树表出现 {len(group)} 次。", suggestion="核对是否为重复挂接或不同设备碰撞。")
+    standard = detect_standard(child_records)
     priority_counts = Counter(item["priority"] for item in issues if item["status"] != "resolved")
     comparison = None
     if comparison_path:
@@ -983,6 +1398,8 @@ def audit_tree_collection(
     )
     result = {
         "version": VERSION,
+        "standard": standard,
+        "standard_display": STANDARD_FULL.get(standard, STANDARD_FULL[STANDARD_DEFAULT]),
         "source_file": str(input_path),
         "sheet": sheet,
         "header_row": header_idx + 1,
@@ -1037,7 +1454,7 @@ def audit_file(
     sheet, rows, header_idx = choose_sheet(wb, requested_sheet)
     _emit_progress(progress_callback, {"phase": "audit", "stage": "structure", "percent": 25, "message": "正在识别工作表结构", "hint": f"当前工作表：{sheet}；数据行：{max(0, len(rows) - header_idx - 1)}"})
     header = rows[header_idx]
-    cols = {kind: find_column(header, kind) for kind in ("kks", "old", "parent", "name", "unit", "dtype", "profession")}
+    cols = {kind: find_column(header, kind) for kind in ("kks", "old", "parent", "name", "unit", "dtype", "profession", "system")}
     missing = [kind for kind in ("kks", "parent", "name") if cols[kind] is None]
     if missing:
         tree_cols = detect_tree_collection_columns(header)
@@ -1078,6 +1495,8 @@ def audit_file(
         else:
             nonempty_without_code.append(rec)
 
+    standard = detect_standard(records)
+
     issues: list[dict[str, Any]] = []
     resolved: list[dict[str, Any]] = []
     by_code: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -1091,26 +1510,54 @@ def audit_file(
                 add_issue(issues, priority="P0", rule_id="KKS-07", category="重复 KKS 码", rec=rec,
                           message=f"KKS 码 {code} 在主表出现 {len(group)} 次。", suggestion="核对是否为后缀丢失或异设备真碰撞；修复前不得导入。")
 
+    # 模式判定：增量新增批次 / 企业两位数字前缀惯例
+    # 增量批次（父级系统码在主库、本文件几乎全为设备级码）里，"父级不在本文件"
+    # 是预期而非缺陷，应转为范围验证项（与广元主库闭合校验），不报 P0 孤儿。
+    code_prefixes = {code[:2] for code in code_set if code}
+    enterprise = enterprise_mode(code_prefixes)
+    total_parent_refs = 0
+    external_parent_refs = 0
+    external_parent_lens: Counter[int] = Counter()
+    for rec in records:
+        parent = rec["parent_code"]
+        if parent and parent not in root_parents:
+            total_parent_refs += 1
+            if parent not in code_set:
+                external_parent_refs += 1
+                external_parent_lens[len(parent)] += 1
+    incremental_batch = (
+        total_parent_refs > 0
+        and external_parent_refs / total_parent_refs >= 0.9
+        and all(length < 12 for length in external_parent_lens)
+    )
+    scope_external_parents: Counter[str] = Counter()
+
     prefix_bad: list[dict[str, Any]] = []
     orphan_recs: list[dict[str, Any]] = []
     for rec in records:
         code, parent = rec["kks_code"], rec["parent_code"]
         if not code:
             continue
+        external_parent = bool(parent) and parent not in root_parents and parent not in code_set
+        if external_parent and incremental_batch:
+            # 增量批次：父级系统/子系统节点在主库（或本批次新增子系统之外），
+            # 记录到范围验证；孤儿、前缀、长度类不再按本文件内部缺陷报 P0。
+            scope_external_parents[parent] += 1
+            # KKS-15 的层级收敛提示、KKS-25 的名称聚簇也归入范围说明，避免 8 千级假阳性
         if not ALLOWED_CODE.fullmatch(code):
             add_issue(issues, priority="P0", rule_id="KKS-04", category="编码含非法字符", rec=rec,
                       message=f"编码含非允许字符：{code}", suggestion="只保留大写字母、数字和约定分隔符；请人工确认。")
         if len(code) not in accepted_lengths:
             add_issue(issues, priority="P0", rule_id="KKS-05", category="编码长度异常", rec=rec,
                       message=f"编码长度为 {len(code)}，不在本表已识别的变长层级/扩展范围内。", suggestion="核对是否误拼接或缺失层级。")
-        if parent and parent not in root_parents and parent not in code_set:
+        if parent and parent not in root_parents and parent not in code_set and not incremental_batch:
             orphan_recs.append(rec)
             add_issue(issues, priority="P0", rule_id="KKS-08", category="父级孤儿", rec=rec,
                       message=f"父级 {parent} 不存在于主表编码集合。", suggestion="补齐父级节点或确认是否引用了未迁移的旧码。")
         if len(code) == 2 and parent not in root_parents and parent in code_set:
             add_issue(issues, priority="P1", rule_id="KKS-12", category="根节点父级非哨兵", rec=rec,
                       message=f"根节点 {code} 的父级为 {parent}，不是空值或 -1 哨兵。", suggestion="核对根节点层级；根节点父级应使用空值或 -1。")
-        if parent and parent not in root_parents and not code.startswith(parent):
+        if parent and parent not in root_parents and parent in code_set and not code.startswith(parent):
             prefix_bad.append(rec)
             add_issue(issues, priority="P0", rule_id="KKS-09", category="父子前缀不一致", rec=rec,
                       message=f"子码 {code} 不以父码 {parent} 开头。", suggestion="核对显式父级指针；舟山变长层级不要按固定长度推导。")
@@ -1122,16 +1569,22 @@ def audit_file(
                       message=f"父级长度 {len(parent)} 不小于子码长度 {len(code)}。", suggestion="核对层级关系。")
 
         if len(code) >= 12:
-            segments = ((0, 2, "机组位"), (2, 5, "系统字母"), (5, 7, "系统编号"), (7, 9, "设备字母"), (9, 12, "设备顺序号"))
+            # 分段结构：全厂码G(1) + 系统前缀号F0(1) + 系统分类码F1F2F3(3) + 系统编号FN(2) + 设备分类码A1A2(2) + 设备编号AN(3)
+            segments = ((0, 1, "全厂码G", "ALNUM"), (1, 2, "系统前缀号F0", "DIGIT"), (2, 5, "系统分类码F1F2F3", "ALPHA"),
+                        (5, 7, "系统编号FN", "DIGIT"), (7, 9, "设备分类码A1A2", "ALPHA"), (9, 12, "设备编号AN", "DIGIT"))
             seg_has_issue = False
-            for start, end, label in segments:
+            for start, end, label, want in segments:
                 part = code[start:end]
-                should_digit = label in {"机组位", "系统编号", "设备顺序号"}
-                ok = part.isdigit() if should_digit else part.isalpha()
+                if want == "ALNUM":
+                    ok = part.isalnum()
+                elif want == "DIGIT":
+                    ok = part.isdigit()
+                else:
+                    ok = part.isalpha()
                 if not ok:
                     seg_has_issue = True
                     suggestion = code
-                    if label == "设备顺序号":
+                    if label == "设备编号AN":
                         suggestion = code[:start] + part.replace("O", "0").replace("o", "0").replace("I", "1").replace("i", "1").replace("l", "1") + code[end:]
                     add_issue(issues, priority="P0", rule_id="KKS-04b", category="分段字符类型错误", rec=rec,
                               message=f"{label}片段 {part!r} 含错误字符。", suggestion=f"建议候选：{suggestion}；必须结合兄弟码/图纸人工确认。")
@@ -1147,15 +1600,21 @@ def audit_file(
 
         if rec["name"] == "":
             add_issue(issues, priority="P0", rule_id="KKS-D", category="有码无名称", rec=rec,
-                      message="有 KKS 码但设备名称为空。", suggestion="补齐设备名称后再审核。")
+                      message="有 KKS 码但设备名称为空（含空格占位）。", suggestion="补齐设备名称后再审核。")
         raw = rec["raw_kks"]
         if raw != raw.strip() or any(ch in raw for ch in "\n\r\t\u3000\xa0"):
             add_issue(issues, priority="P1", rule_id="KKS-30", category="编码文本卫生", rec=rec,
                       message="编码含首尾空白、换行、制表符或全角空格。", suggestion="建议清洗文本后重新审核，不直接覆盖源表。")
         raw_name = rec["raw_name"]
-        if any(ch in raw_name for ch in "\n\r\t\u3000\xa0"):
+        whitespace_hits = rec["name"] and any(ch in raw_name for ch in "\n\r\t\u3000\xa0")
+        if whitespace_hits:
+            # 名称为空的行已由 KKS-D(空名) 报告，此处不再重复报名称卫生
             add_issue(issues, priority="P1", rule_id="KKS-30", category="名称文本卫生", rec=rec,
                       message="名称含首尾空白、换行、制表符或全角空格。", suggestion="建议清洗文本后重新审核。")
+        elif rec["name"] and re.search(r"[\uff01-\uff5e\u3000-\u303f]", raw_name):
+            # 全角符号（（）、：、，等）→ P2 半角化清洗提示（与广元口径一致）
+            add_issue(issues, priority="P2", rule_id="KKS-30", category="名称文本卫生(全角)", rec=rec,
+                      message="名称含全角符号（括号/冒号/逗号等），建议半角化统一。", suggestion="全角→半角统一、去除首尾空格后再合入主库。")
         unusual_name_chars = re.findall(r"[^\u4e00-\u9fffA-Za-z0-9()（）\[\]【】.\-—_/\\,，、;；:：%#+*&~°℃㎡\"“”‘’!！?？\s]", raw_name)
         if unusual_name_chars:
             chars = "".join(dict.fromkeys(unusual_name_chars))
@@ -1167,12 +1626,34 @@ def audit_file(
                 suggestion = "清理符号并人工确认名称语义。"
             add_issue(issues, priority="P1", rule_id="KKS-27", category="名称非常规符号", rec=rec,
                       message=message, suggestion=suggestion)
-        if len(rec["name"]) < 2 or (not re.search(r"[\u4e00-\u9fffA-Za-z]", rec["name"])):
+        if rec["name"] and (len(rec["name"]) < 2 or not re.search(r"[\u4e00-\u9fffA-Za-z]", rec["name"])):
+            # 空名行已由 KKS-D 报告，这里只对"非空但语义可疑"的短名/纯符号名提示人工核
             add_issue(issues, priority="P2", rule_id="KKS-27", category="名称语义需人核", rec=rec,
                       message="名称过短或无法提取中文/字母语义。", suggestion="人工核对名称，不按此项自动判错。", status="needs_review")
 
-        expected = code_unit(code[:2], common_units)
-        if expected is not None:
+        expected = code_unit(code[0], common_units)
+        if enterprise and len(code) >= 2 and code[:2] in ENTERPRISE_UNIT_PREFIXES:
+            # 企业惯例（00/01/02/61）：编码前缀是权威机组标识，只核对"机组列"文本。
+            # 文本应与前缀规范表达全等，避免把 61(1,2号公用) 误判成 6 号机。
+            prefix = code[:2]
+            unit_text = rec.get("unit", "")
+            norm = ""
+            if unit_text:
+                if "公用" in unit_text or "公共" in unit_text:
+                    nums = sorted({int(x) for x in re.findall(r"\d+", unit_text)})
+                    norm = "公用" if not nums else (",".join(str(x) for x in nums) + "号公用")
+                else:
+                    m = NAME_UNIT.search(unit_text)
+                    if m:
+                        key = m.group(1)
+                        num = CN_NUM[key] if key in CN_NUM else int(key)
+                        norm = f"{num}号"
+            expect_norm = "全厂公用" if prefix == "00" else ENTERPRISE_UNIT_PREFIXES.get(prefix, prefix)
+            if unit_text and norm and norm not in expect_norm:
+                add_issue(issues, priority="P1", rule_id="KKS-28", category="机组三方不一致", rec=rec,
+                          message=f"机组列文本为{unit_text!r}，但编码前缀 {prefix} 表示{expect_norm}。",
+                          suggestion="以编码前缀(00/01/02/61)为准校正机组列文本。")
+        elif expected is not None:
             for field, label in (("name", "名称"), ("unit", "机组列")):
                 m = NAME_UNIT.search(rec[field]) if rec[field] else None
                 if not m:
@@ -1188,18 +1669,25 @@ def audit_file(
                                   message=f"{label}指向 {found} 号，但编码前缀指向 {expected} 号。", suggestion="核对编码、机组列与名称三方，不自动改码。")
 
         old, new = rec["old_code"], rec["kks_code"]
+        # 全厂码 G 取值合规：G 必须在 1-9 / A-G / J-R / S-V / Y / 自由字母内
+        # 企业惯例（00/01/02/61 两位数字前缀）视为合法，不按国标单字符 G 表判非法。
+        g_char = code[0] if code else ""
+        if g_char and not valid_g_char(g_char) and not enterprise_unit_ok(code):
+            add_issue(issues, priority="P0", rule_id="KKS-06", category="全厂码 G 取值非法", rec=rec,
+                      message=f"全厂码 G={g_char!r} 不在合法取值范围内（1-9/A-G/J-R/S-V/Y，自由字母 H/W/X/Z；企业惯例 00/01/02/61）。", suggestion="核对是否为旧版前缀（50/60/L0/J0 现行体系下 G=5/6/L/J 合法）或录入错误。")
+        # 10 版旧前缀迁移：G=5/6/L/J 本身合法，迁移 50→05 等属项目约定，仅作 P2 历史提示
         if old and new and old[:2] != new[:2]:
             expected_prefix = old_prefix_migrations.get(old[:2])
             if expected_prefix and new[:2] != expected_prefix:
-                add_issue(issues, priority="P1", rule_id="KKS-13/16", category="旧码迁移疑点", rec=rec,
-                          message=f"原码前缀 {old[:2]} 按规则应迁移为 {expected_prefix}，当前新码为 {new[:2]}。", suggestion="核对 10 版→20 版迁移表和设备语义。")
+                add_issue(issues, priority="P2", rule_id="KKS-13/16", category="旧码迁移历史提示", rec=rec,
+                          message=f"原码前缀 {old[:2]} 若按项目 10 版→20 版约定应迁移为 {expected_prefix}，当前新码为 {new[:2]}。", suggestion="编码体系不定义版本迁移；如属项目约定请核对迁移表，历史原码保留。", status="needs_review")
             else:
                 add_issue(issues, priority="P2", rule_id="KKS-18", category="历史原码与新码前缀变化", rec=rec,
                           message=f"原 KKS 前缀 {old[:2]} 与新 KKS 前缀 {new[:2]} 不同。", suggestion="确认历史映射；若新码、父级、机组三方一致，可作为历史提示保留。", status="needs_review")
 
         if code[:2] in old_prefix_migrations:
-            add_issue(issues, priority="P1", rule_id="KKS-16", category="新码仍保留旧格式前缀", rec=rec,
-                      message=f"当前 KKS 编码仍使用旧格式前缀 {code[:2]}。", suggestion="核对 10 版→20 版迁移结果；历史原码可以保留，但新码不应直接沿用。")
+            add_issue(issues, priority="P2", rule_id="KKS-16", category="旧版前缀历史提示", rec=rec,
+                      message=f"当前 KKS 编码前两位 {code[:2]} 命中 10 版旧前缀表（{code[:2]}）。", suggestion="G=5/6/L/J 本身合法（分别为 5/6 号机与期别公用），仅提示核对；历史原码可保留。", status="needs_review")
 
     unique_records_by_code = {code: group[0] for code, group in by_code.items() if len(group) == 1}
     skill_template_diagnostics = _apply_template_skill_rules(
@@ -1247,15 +1735,51 @@ def audit_file(
     for rec in records:
         if rec["old_code"]:
             old_to_new[rec["old_code"]].add(rec["kks_code"])
-    for old_code, new_codes in old_to_new.items():
-        if len(new_codes) > 1:
-            for rec in records:
-                if rec["old_code"] == old_code:
-                    add_issue(issues, priority="P1", rule_id="KKS-25c", category="同一原码对应多个新码", rec=rec,
-                              message=f"原 KKS {old_code} 对应多个新码：{', '.join(sorted(new_codes))}。", suggestion="用原码作为 1:1 身份键人工裁定，不自动合并。")
+    # 原KKS 一对多已由模板规则 identity_dup_by_key(KKS-25c) 按身份键逐组上报，
+    # 此处不再重复逐行添加，避免同源问题双份计数。
+
+    # 范围与结构说明：增量新增批次(父级在主库)、旧扩展码收敛为 12 位主码、
+    # 企业两位前缀惯例，都属于"范围/约定"而非文件内部缺陷，汇总成结构化说明供报告引用。
+    converged_old_lens = additional_skill_diagnostics.get("converged_to_master_old_len", {}) or {}
+    converged_rows = sum(converged_old_lens.values())
+    parent_rows_external = sum(scope_external_parents.values())
+    root_rows = sum(1 for r in records if r["parent_code"] in root_parents)
+    scope_notes: list[str] = []
+    if incremental_batch:
+        scope_notes.append(
+            f"本文件为增量新增批次：{parent_rows_external} 行引用的父级系统/子系统节点在主库、不在本文件内"
+            f"（去重 {len(scope_external_parents)} 个），按主库闭合校验处理，不视为孤儿缺陷。"
+        )
+        if converged_rows:
+            scope_notes.append(
+                f"共 {converged_rows} 行原扩展码/旧码（长度 {', '.join(f'{k}位' for k in sorted(converged_old_lens))}）"
+                "收敛为 12 位主码，属本次新增的标准化业务，未逐条列入问题。"
+            )
+    elif converged_rows:
+        scope_notes.append(
+            f"共 {converged_rows} 行旧码非 12 位而新码为 12 位主码，按标准化收敛业务处理，未逐条列入问题。"
+        )
+    if enterprise:
+        scope_notes.append(
+            "识别为企业惯例两位数字前缀（00=全厂公用 / 01=1号 / 02=2号 / 61=1,2号公用），"
+            "全厂码 G 取值校验按企业惯例放行。"
+        )
+    scope_validation = {
+        "mode": "incremental" if incremental_batch else "full",
+        "incremental_batch": incremental_batch,
+        "enterprise": enterprise,
+        "data_rows": len(records),
+        "root_rows": root_rows,
+        "external_parent_rows": parent_rows_external,
+        "external_parent_units": len(scope_external_parents),
+        "external_parent_samples": [{"parent": p, "children": n} for p, n in scope_external_parents.most_common(15)],
+        "converged_to_master_rows": converged_rows,
+        "converged_old_lengths": dict(sorted(converged_old_lens.items())),
+        "notes": scope_notes,
+    }
 
     # Preserve a structural note rather than treating intentionally blank separator rows as records.
-    notes = []
+    notes = list(scope_notes)
     if len(sheet_info) > 1:
         empty_sheets = [x["sheet"] for x in sheet_info if x["nonempty_rows"] == 0]
         if empty_sheets:
@@ -1273,6 +1797,8 @@ def audit_file(
     )
     result = {
         "version": VERSION,
+        "standard": standard,
+        "standard_display": STANDARD_FULL.get(standard, STANDARD_FULL[STANDARD_DEFAULT]),
         "source_file": str(input_path),
         "sheet": sheet,
         "header_row": header_idx + 1,
@@ -1298,6 +1824,7 @@ def audit_file(
         "resolved_count": len(resolved),
         "conclusion": conclusion,
         "structural_notes": notes,
+        "scope_validation": scope_validation,
         "issues": issues,
         "resolved_reviews": resolved,
         "skill_coverage": {
@@ -1326,289 +1853,19 @@ def audit_file(
     return result
 
 
-def write_issue_workbook_xlsx(path: Path, result: dict[str, Any]) -> None:
-    """生成面向业务交付的问题清单，技术 AI 依据放入隐藏页。"""
-    wb = Workbook()
-    summary = wb.active
-    summary.title = "概览"
-    issues_ws = wb.create_sheet("问题清单")
-    ai_ws = wb.create_sheet("AI复核（技术）")
-    resolved_ws = wb.create_sheet("已澄清项")
-    structure_ws = wb.create_sheet("文件结构")
-    coverage_ws = wb.create_sheet("规则覆盖")
-    blue, pale_blue, gray, pale_red, pale_amber, pale_green = "1D4ED8", "EFF6FF", "F8FAFC", "FEF2F2", "FFFBEB", "F0FDF4"
+def write_issue_workbook_xlsx(path: Path, result: dict[str, Any], overview: dict[str, Any] | None = None) -> None:
+    """生成面向业务交付的问题清单（广元风格：概览 + 每类问题定制 sheet）。"""
+    if overview is None:
+        overview = build_overview(result)
+    render_xlsx(path, result, overview)
 
-    def header_style(ws, cell_range: str, color: str = blue) -> None:
-        for row in ws[cell_range]:
-            for cell in row:
-                cell.fill = PatternFill("solid", fgColor=color)
-                cell.font = Font(bold=True, color="FFFFFF")
-                cell.alignment = Alignment(vertical="center", wrap_text=True)
 
-    def body_style(ws, cell_range: str) -> None:
-        for row in ws[cell_range]:
-            for cell in row:
-                cell.alignment = Alignment(vertical="top", wrap_text=True)
-
-    def autosize(ws, maximum: int = 52) -> None:
-        for col_idx in range(1, ws.max_column + 1):
-            letter = get_column_letter(col_idx)
-            max_len = max((len(str(ws.cell(row=row_idx, column=col_idx).value or "")) for row_idx in range(1, ws.max_row + 1)), default=0)
-            ws.column_dimensions[letter].width = min(max(max_len + 2, 12), maximum)
-
-    def add_table(ws, name: str, end_column: int) -> None:
-        end_row = max(1, ws.max_row)
-        ref = f"A1:{get_column_letter(end_column)}{end_row}"
-        table = Table(displayName=name, ref=ref)
-        table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=False)
-        ws.add_table(table)
-
-    for ws in wb.worksheets:
-        ws.sheet_view.showGridLines = False
-
-    metrics = quality_metrics(result)
-    counts = result.get("final_decision_counts", final_decision_counts(result))
-    dimensions = report_quality_dimensions(result)
-    report_issues = sorted(_report_issues(result), key=lambda item: ({"P0": 0, "P1": 1, "P2": 2}.get(str(item.get("priority")), 9), int(item.get("excel_row", 0) or 0)))
-
-    summary.merge_cells("A1:H1")
-    summary["A1"] = "KKS 编码质量审核报告"
-    summary["A1"].fill = PatternFill("solid", fgColor=blue)
-    summary["A1"].font = Font(bold=True, color="FFFFFF", size=16)
-    summary["A1"].alignment = Alignment(horizontal="center", vertical="center")
-    summary.row_dimensions[1].height = 28
-    summary.merge_cells("A2:H2")
-    summary["A2"] = f"源文件：{result['source_file']}；主表：{result['sheet']}；表头行：{result['header_row']}"
-    summary["A2"].fill = PatternFill("solid", fgColor=pale_blue)
-    summary["A2"].alignment = Alignment(wrap_text=True)
-    summary.merge_cells("A4:H4")
-    summary["A4"] = "一、总体结论"
-    header_style(summary, "A4:H4")
-    summary.merge_cells("A5:H6")
-    summary["A5"] = report_import_conclusion(result)
-    summary["A5"].fill = PatternFill("solid", fgColor=pale_green if not metrics["p0"] and not metrics["p1"] else pale_amber)
-    summary["A5"].alignment = Alignment(vertical="center", wrap_text=True)
-
-    summary.merge_cells("A8:H8")
-    summary["A8"] = "二、关键质量指标"
-    header_style(summary, "A8:H8")
-    summary.append(["指标", "结果", "指标", "结果", "指标", "结果", "指标", "结果"])
-    header_style(summary, f"A{summary.max_row}:H{summary.max_row}")
-    metric_pairs = [("有效 KKS 数量", metrics["effective_kks"]), ("设备级编码", metrics["device_level_codes"]), ("重复编码", metrics["duplicate_codes"]), ("父级错误", metrics["parent_errors"]), ("高风险问题（P0）", metrics["p0"]), ("待治理问题（P1）", metrics["p1"]), ("历史迁移问题（P2）", metrics["p2"])]
-    for index in range(0, len(metric_pairs), 4):
-        row = []
-        for label, value in metric_pairs[index:index + 4]:
-            row.extend([label, value])
-        summary.append(row)
-    body_style(summary, f"A{summary.max_row - 1}:H{summary.max_row}")
-
-    summary.merge_cells("A12:H12")
-    summary["A12"] = "三、KKS 八维审核结果"
-    header_style(summary, "A12:H12")
-    summary.append(["维度", "检查项", "结果", "说明"])
-    header_style(summary, f"A{summary.max_row}:D{summary.max_row}")
-    dimension_header_row = summary.max_row
-    summary.merge_cells(start_row=dimension_header_row, start_column=4, end_row=dimension_header_row, end_column=8)
-    for item in dimensions:
-        summary.append([item["dimension"], item["check"], item["result"], item["detail"]])
-        dimension_row = summary.max_row
-        summary.merge_cells(start_row=dimension_row, start_column=4, end_row=dimension_row, end_column=8)
-    body_style(summary, f"A{summary.max_row - len(dimensions) + 1}:D{summary.max_row}")
-
-    summary.merge_cells("A22:H22")
-    summary["A22"] = "四、P0/P1/P2 问题分析"
-    header_style(summary, "A22:H22")
-    summary.append(["等级", "含义", "数量", "处置要求"])
-    header_style(summary, f"A{summary.max_row}:D{summary.max_row}")
-    priority_header_row = summary.max_row
-    summary.merge_cells(start_row=priority_header_row, start_column=4, end_row=priority_header_row, end_column=8)
-    for level, meaning, requirement in (("P0", "阻断问题", "必须修改并复核后才能导入"), ("P1", "结构治理问题", "完成治理或人工确认后再导入"), ("P2", "历史迁移问题", "保留原码证据，按迁移策略处理")):
-        summary.append([level, meaning, metrics[level.lower()], requirement])
-        priority_row = summary.max_row
-        summary.merge_cells(start_row=priority_row, start_column=4, end_row=priority_row, end_column=8)
-    body_style(summary, f"A{summary.max_row - 2}:D{summary.max_row}")
-
-    summary.merge_cells("A27:H27")
-    summary["A27"] = "五、问题整改建议"
-    header_style(summary, "A27:H27")
-    summary.merge_cells("A28:H29")
-    summary["A28"] = "优先处理 P0 阻断问题；再治理 P1 扩展编码；P2 历史迁移保留原始证据，不直接覆盖源 Excel。其余规则提示仍保留在详细问题清单，整改完成后应重新审核并做目标库导入前验证。"
-    summary["A28"].fill = PatternFill("solid", fgColor=gray)
-    summary["A28"].alignment = Alignment(wrap_text=True, vertical="center")
-
-    summary.merge_cells("A31:H31")
-    summary["A31"] = "六、导入评估结论"
-    header_style(summary, "A31:H31")
-    summary.merge_cells("A32:H33")
-    summary["A32"] = report_import_conclusion(result)
-    summary["A32"].fill = PatternFill("solid", fgColor=pale_amber)
-    summary["A32"].alignment = Alignment(wrap_text=True, vertical="center")
-    summary.merge_cells("A35:H35")
-    summary["A35"] = "审核方法"
-    header_style(summary, "A35:H35")
-    for method in REPORT_METHODS:
-        summary.append([f"• {method}"])
-        summary.merge_cells(start_row=summary.max_row, start_column=1, end_row=summary.max_row, end_column=8)
-        summary.cell(summary.max_row, 1).fill = PatternFill("solid", fgColor=gray)
-    summary.append(["源 Excel 始终只读；本次未连接真实 DM8/LOCATIONS 做导入验证。"])
-    summary.merge_cells(start_row=summary.max_row, start_column=1, end_row=summary.max_row, end_column=8)
-    summary.cell(summary.max_row, 1).fill = PatternFill("solid", fgColor=gray)
-    summary.freeze_panes = "A4"
-    autosize(summary, 58)
-    for column, width in {"A": 19, "B": 13, "C": 19, "D": 13, "E": 19, "F": 13, "G": 19, "H": 13}.items():
-        summary.column_dimensions[column].width = width
-
-    issue_headers = ["等级", "规则", "Excel 行号", "KKS", "问题", "整改建议"]
-    issues_ws.append(issue_headers)
-    for item in report_issues:
-        decision = str(item.get("final_decision", ""))
-        action = {"confirmed_issue": "需整改", "needs_human": "需确认", "likely_false_positive": "建议抽查"}.get(decision, "待确认")
-        message = item.get("final_summary") or item.get("message") or item.get("category") or "待核问题"
-        suggestion = item.get("final_suggestion") or item.get("suggestion") or "请结合原始 Excel 和业务资料确认。"
-        issues_ws.append([item.get("priority", "P2"), item.get("rule_id", ""), item.get("excel_row", ""), item.get("kks_code", ""), f"{action}：{message}", suggestion])
-    header_style(issues_ws, "A1:F1")
-    body_style(issues_ws, f"A1:F{max(1, issues_ws.max_row)}")
-    issues_ws.freeze_panes = "A2"
-    issues_ws.auto_filter.ref = f"A1:F{max(1, issues_ws.max_row)}"
-    autosize(issues_ws, 60)
-    add_table(issues_ws, "KKSIssues", 6)
-
-    ai_headers = ["内部状态", "等级", "规则", "Excel 行号", "KKS", "原始问题", "规则证据", "AI 初审", "AI 二次复核", "AI 置信度", "AI 证据", "AI 原因", "AI 建议", "最终判断", "最终证据", "最终原因", "最终建议"]
-    ai_ws.append(ai_headers)
-    for item in report_issues:
-        ai_ws.append([item.get("status", ""), item.get("priority", "P2"), item.get("rule_id", ""), item.get("excel_row", ""), item.get("kks_code", ""), item.get("message", ""), item.get("evidence", ""), item.get("ai_initial_decision", ""), item.get("ai_verification_decision", ""), item.get("ai_confidence", ""), item.get("ai_evidence", ""), item.get("ai_reason", ""), item.get("ai_suggestion", ""), final_decision_label(item.get("final_decision", "")), item.get("final_evidence", ""), item.get("final_reason", ""), item.get("final_suggestion", "")])
-    header_style(ai_ws, f"A1:{get_column_letter(len(ai_headers))}1")
-    body_style(ai_ws, f"A1:{get_column_letter(len(ai_headers))}{max(1, ai_ws.max_row)}")
-    ai_ws.freeze_panes = "A2"
-    ai_ws.auto_filter.ref = f"A1:{get_column_letter(len(ai_headers))}{max(1, ai_ws.max_row)}"
-    autosize(ai_ws, 55)
-    ai_ws.sheet_state = "hidden"
-
-    resolved_ws.append(["Excel 行号", "KKS", "复核结论", "证据"])
-    for item in result.get("resolved_reviews", []):
-        resolved_ws.append([item.get("excel_row", ""), item.get("kks_code", ""), item.get("message", ""), item.get("evidence", "")])
-    header_style(resolved_ws, "A1:D1")
-    body_style(resolved_ws, f"A1:D{max(1, resolved_ws.max_row)}")
-    resolved_ws.freeze_panes = "A2"
-    resolved_ws.auto_filter.ref = f"A1:D{max(1, resolved_ws.max_row)}"
-    autosize(resolved_ws)
-    add_table(resolved_ws, "KKSResolved", 4)
-
-    structure_ws.append(["Sheet", "最大行", "最大列", "非空行", "首个非空行", "最后非空行", "表头预览"])
-    for item in result.get("sheet_info", []):
-        preview = " | ".join(str(x) for x in item.get("header_preview", []))
-        structure_ws.append([item.get(key, "") for key in ("sheet", "max_row", "max_col", "nonempty_rows", "first_nonempty_row", "last_nonempty_row")] + [preview])
-    header_style(structure_ws, "A1:G1")
-    body_style(structure_ws, f"A1:G{max(1, structure_ws.max_row)}")
-    structure_ws.freeze_panes = "A2"
-    structure_ws.auto_filter.ref = f"A1:G{max(1, structure_ws.max_row)}"
-    autosize(structure_ws)
-    add_table(structure_ws, "KKSSheets", 7)
-
-    coverage_ws.append(["维度", "规则", "执行状态", "命中数", "执行/证据来源"])
-    issue_counts = Counter(item.get("rule_id", "") for item in _report_issues(result))
-    coverage_items = [
-        ("文件与结构", "01-03", "已执行", "动态 Sheet、表头和列定位", "kks-audit/SKILL.md"),
-        ("语法与格式", "KKS-04/04b/05/06/29/30", "已执行", "字符、长度、OCR 和文本卫生", "kks-audit/SKILL.md + audit_template.py"),
-        ("唯一性", "KKS-07", "已执行", "重复码和跨设备碰撞诊断", "audit_template.py"),
-        ("层级树", "KKS-08~KKS-12", "已执行", "孤儿、父子关系和父级链", "kks-audit/SKILL.md"),
-        ("历史迁移", "KKS-13/14/15/16/18/25c", "已执行", "旧码、新码和一对多映射", "kks-audit/SKILL.md + config/kks_rules.json"),
-        ("语义与命名", "KKS-17/22/24~31/A/C/E/F/G", "已执行", "扩展码、名称和语义一致性", "audit_template.py + SKILL.md"),
-        ("跨范围对比", "KKS-19/20/21", "已执行" if result.get("scope_comparison") else "未提供对比文件", "专业覆盖、编码深度和数量瀑布", "--compare-file"),
-        ("导入评估", "KKS-22/23", "已执行", "LOCATIONS 约束和历史双码策略", "kks-audit/SKILL.md"),
-    ]
-    for dimension, rule_id, status, hit_note, source in coverage_items:
-        hit_value = sum(issue_counts.get(rule, 0) for rule in re.split(r"[/~]", rule_id) if issue_counts.get(rule))
-        coverage_ws.append([dimension, rule_id, status, hit_value, f"{hit_note}；{source}"])
-    header_style(coverage_ws, "A1:E1")
-    body_style(coverage_ws, f"A1:E{max(1, coverage_ws.max_row)}")
-    coverage_ws.freeze_panes = "A2"
-    coverage_ws.auto_filter.ref = f"A1:E{max(1, coverage_ws.max_row)}"
-    autosize(coverage_ws)
-    add_table(coverage_ws, "KKSCoverage", 5)
-
+def write_html(path: Path, result: dict[str, Any], overview: dict[str, Any] | None = None) -> None:
+    """生成广元风格 HTML 审核报告（业务分组 + 样例截断，体积可控）。"""
+    if overview is None:
+        overview = build_overview(result)
     path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(path)
-
-
-def write_html(path: Path, result: dict[str, Any]) -> None:
-    metrics = quality_metrics(result)
-    final_counts = result.get("final_decision_counts", final_decision_counts(result))
-    rows = sorted(_report_issues(result), key=lambda item: ({"P0": 0, "P1": 1, "P2": 2}.get(str(item.get("priority")), 9), int(item.get("excel_row", 0) or 0)))
-    ai = result.get("ai_review", {})
-
-    def action_label(item: dict[str, Any]) -> str:
-        return {"confirmed_issue": "需整改", "needs_human": "需确认", "likely_false_positive": "建议抽查"}.get(str(item.get("final_decision", "")), "待确认")
-
-    def detail_text(item: dict[str, Any]) -> str:
-        return str(item.get("final_summary") or item.get("message") or item.get("category") or "待核问题")
-
-    def suggestion_text(item: dict[str, Any]) -> str:
-        return str(item.get("final_suggestion") or item.get("suggestion") or "请结合原始 Excel 和业务资料确认。")
-
-    rows_html = "".join(
-        f"<tr><td><span class='priority p{html.escape(str(item.get('priority', 'P2'))[-1])}'>{html.escape(str(item.get('priority', 'P2')))}</span></td>"
-        f"<td>{html.escape(str(item.get('rule_id', '')))}</td><td>{html.escape(str(item.get('excel_row', '')))}</td>"
-        f"<td><code>{html.escape(str(item.get('kks_code', '')))}</code></td>"
-        f"<td><b>{html.escape(action_label(item))}</b>：{html.escape(detail_text(item))}</td>"
-        f"<td>{html.escape(suggestion_text(item))}</td></tr>"
-        for item in rows
-    ) or '<tr><td colspan="6" class="empty">未发现需要列入清单的问题</td></tr>'
-
-    dimension_rows = "".join(
-        f"<tr><td><b>{html.escape(item['dimension'])}</b></td><td>{html.escape(item['check'])}</td>"
-        f"<td><span class='result-pill {'ok' if item['result'] == '通过' else 'warn'}'>{html.escape(item['result'])}</span></td>"
-        f"<td>{html.escape(item['detail'])}</td></tr>"
-        for item in report_quality_dimensions(result)
-    )
-    priority_rows = "".join(
-        f"<div class='priority-card p{level[-1]}'><strong>{level} · {meaning}</strong><b>{metrics[level.lower()]}</b><span>{requirement}</span></div>"
-        for level, meaning, requirement in (("P0", "阻断问题", "必须修改并复核后才能导入"), ("P1", "结构治理问题", "完成治理或人工确认后再导入"), ("P2", "历史迁移问题", "保留原码证据，按迁移策略处理"))
-    )
-    methods_html = "".join(f"<li>{html.escape(method)}</li>" for method in REPORT_METHODS)
-    notes_html = "".join(f"<li>{html.escape(str(note))}</li>" for note in result.get("structural_notes", []))
-
-    def ai_detail(item: dict[str, Any]) -> str:
-        try:
-            confidence = f"{float(item.get('ai_confidence', 0)):.0%}"
-        except (TypeError, ValueError):
-            confidence = "—"
-        return (
-            f"<details class='ai-detail'><summary>查看 AI 依据</summary>"
-            f"<div class='ai-grid'><span>初审</span><b>{html.escape(str(item.get('ai_initial_decision') or item.get('ai_decision') or '未返回'))}</b>"
-            f"<span>二次复核</span><b>{html.escape(str(item.get('ai_verification_decision') or '未触发'))}</b>"
-            f"<span>置信度</span><b>{confidence}</b><span>证据</span><p>{html.escape(str(item.get('ai_evidence') or item.get('final_evidence') or item.get('evidence') or '未提供'))}</p>"
-            f"<span>原因</span><p>{html.escape(str(item.get('ai_reason') or item.get('final_reason') or '未提供'))}</p>"
-            f"<span>建议</span><p>{html.escape(str(item.get('ai_suggestion') or item.get('final_suggestion') or '未提供'))}</p></div></details>"
-        )
-
-    ai_rows = "".join(
-        f"<tr><td>{html.escape(str(item.get('priority', 'P2')))}</td><td>{html.escape(str(item.get('excel_row', '')))}</td><td>{html.escape(str(item.get('kks_code', '')))}</td><td>{ai_detail(item)}</td></tr>"
-        for item in rows if item.get("ai_decision") or item.get("ai_initial_decision") or item.get("ai_evidence")
-    ) or '<tr><td colspan="4" class="empty">本次未产生 AI 复核明细</td></tr>'
-    comparison = result.get("scope_comparison")
-    comparison_html = ""
-    if comparison:
-        waterfall = comparison.get("quantity_waterfall", {})
-        comparison_html = f"<details class='technical'><summary>查看跨范围对比结果</summary><p>对比文件：{html.escape(str(comparison.get('comparison', {}).get('file', '')))}；有效编码数量差：{waterfall.get('primary_minus_comparison', '—')}；瀑布闭合：{html.escape(str(waterfall.get('closed', '—')))}。</p><pre>{html.escape(json.dumps(comparison, ensure_ascii=False, indent=2))}</pre></details>"
-    ai_meta = f"状态：{html.escape(str(ai.get('status', 'disabled')))}；候选项 {ai.get('candidate_count', 0)}；已复核 {ai.get('reviewed_count', 0)}；疑似误报二次核验 {ai.get('verified_count', 0)}。"
-    body = f"""<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>KKS 编码质量审核报告</title>
-<style>
-:root{{--blue:#1d4ed8;--navy:#102a43;--ink:#243b53;--muted:#627d98;--line:#d9e2ec;--soft:#f7faff;--green:#16845b;--amber:#b45309;--red:#c2413b}}
-*{{box-sizing:border-box}}body{{margin:0;background:#f5f8fc;color:var(--ink);font:14px/1.65 "Segoe UI","Microsoft YaHei",Arial,sans-serif}}.page{{max-width:1440px;margin:0 auto;padding:32px 38px 56px}}.top{{display:flex;justify-content:space-between;gap:24px;align-items:flex-start;padding:22px 26px;background:#fff;border:1px solid var(--line);border-radius:18px;box-shadow:0 8px 24px rgba(16,42,67,.05)}}h1{{margin:0;color:var(--navy);font-size:30px;letter-spacing:-.5px}}.eyebrow{{margin-bottom:5px;color:#315dcc;font-size:11px;font-weight:800;letter-spacing:1.6px}}.meta{{margin:10px 0 0;color:var(--muted);font-size:13px}}.status{{padding:8px 13px;border:1px solid #bbf7d0;border-radius:999px;background:#f0fdf4;color:var(--green);font-weight:700;white-space:nowrap}}.section{{margin-top:22px;padding:24px 26px;background:#fff;border:1px solid var(--line);border-radius:16px;box-shadow:0 6px 20px rgba(16,42,67,.04)}}h2{{margin:0 0 15px;color:var(--navy);font-size:20px;border-left:4px solid var(--blue);padding-left:11px}}h3{{margin:0 0 12px;color:var(--navy);font-size:16px}}.conclusion{{padding:16px 18px;border:1px solid #bfdbfe;border-radius:12px;background:#eff6ff;font-size:15px;font-weight:650;color:#173f7a}}.kpis{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}}.kpi{{min-height:94px;padding:15px 16px;border:1px solid var(--line);border-radius:12px;background:linear-gradient(145deg,#fff,#f8fbff)}}.kpi label{{display:block;color:var(--muted);font-size:12px;font-weight:650}}.kpi b{{display:block;margin-top:6px;color:var(--navy);font-size:27px;line-height:1.1}}table{{width:100%;border-collapse:separate;border-spacing:0;overflow:hidden;border:1px solid var(--line);border-radius:12px;font-size:13px}}th,td{{padding:10px 11px;text-align:left;vertical-align:top;border-bottom:1px solid #e8eef5}}th{{background:#eff6ff;color:#173f7a;font-weight:800}}tr:last-child td{{border-bottom:0}}tbody tr:hover{{background:#fbfdff}}.result-pill{{display:inline-flex;padding:3px 8px;border-radius:999px;font-size:12px;font-weight:750}}.result-pill.ok{{background:#ecfdf5;color:#047857}}.result-pill.warn{{background:#fff7ed;color:#b45309}}.priority-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}}.priority-card{{display:grid;grid-template-columns:1fr auto;gap:2px 10px;padding:15px 16px;border:1px solid var(--line);border-left:4px solid var(--blue);border-radius:12px;background:#fbfdff}}.priority-card strong{{font-size:14px}}.priority-card b{{grid-row:span 2;color:var(--navy);font-size:28px}}.priority-card span{{color:var(--muted);font-size:12px}}.priority-card.p0{{border-left-color:var(--red);background:#fffafa}}.priority-card.p1{{border-left-color:#f59e0b;background:#fffdf7}}.priority-card.p2{{border-left-color:var(--blue)}}.priority{{display:inline-flex;min-width:34px;justify-content:center;padding:3px 8px;border-radius:6px;font-weight:800}}.priority.p0{{background:#fee2e2;color:#b91c1c}}.priority.p1{{background:#fef3c7;color:#a16207}}.priority.p2{{background:#dbeafe;color:#1d4ed8}}code{{padding:2px 5px;border-radius:5px;background:#f1f5f9;color:#19324d;font-family:Consolas,monospace;font-size:12px}}.methods{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px 24px;margin:0;padding-left:22px}}.methods li{{color:#3e5871}}.advice{{padding:15px 17px;border-radius:12px;background:#f8fafc;border:1px solid var(--line)}}.import{{padding:16px 18px;border-radius:12px;background:#fff7ed;border:1px solid #fed7aa;color:#92400e;font-weight:650}}.empty{{padding:18px;text-align:center;color:#94a3b8}}details{{margin-top:12px;border:1px solid var(--line);border-radius:10px;background:#fbfdff}}summary{{cursor:pointer;padding:10px 12px;color:#2454ad;font-weight:750}}.ai-detail{{margin:0;border:0;background:transparent}}.ai-detail summary{{padding:0 0 7px;font-size:12px}}.ai-grid{{display:grid;grid-template-columns:80px 1fr;gap:5px 10px;padding:0 12px 12px;color:var(--muted);font-size:12px}}.ai-grid b{{color:var(--ink)}}.ai-grid p{{margin:0;color:var(--ink)}}.technical pre{{max-height:360px;overflow:auto;padding:12px;background:#172033;color:#dbeafe;border-radius:8px;font-size:12px}}.footer{{margin-top:22px;color:#718096;font-size:12px}}@media(max-width:950px){{.page{{padding:20px 16px 40px}}.kpis{{grid-template-columns:repeat(2,minmax(0,1fr))}}.priority-grid{{grid-template-columns:1fr}}.top{{display:block}}.status{{display:inline-flex;margin-top:12px}}}}@media(max-width:560px){{.kpis{{grid-template-columns:1fr 1fr;gap:8px}}.section{{padding:18px 15px}}h1{{font-size:24px}}table{{font-size:12px}}th,td{{padding:8px}}.methods{{grid-template-columns:1fr}}}}
-@media print{{body{{background:#fff}}.page{{max-width:none;padding:0}}.section,.top{{box-shadow:none;break-inside:avoid}}details{{display:none}}}}
-</style></head><body><main class='page'>
-<header class='top'><div><div class='eyebrow'>KKS QUALITY CONTROL</div><h1>KKS 编码质量审核报告</h1><p class='meta'>源文件：{html.escape(str(result['source_file']))}<br>主表：{html.escape(str(result['sheet']))} · 表头行：{result['header_row']} · 审核范围：{metrics['effective_kks']} 条有效 KKS</p></div><span class='status'>质量审核结论</span></header>
-<section class='section'><h2>一、总体结论</h2><div class='conclusion'>{html.escape(report_import_conclusion(result))}</div></section>
-<section class='section'><h2>二、关键质量指标</h2><div class='kpis'><div class='kpi'><label>有效 KKS 数量</label><b>{metrics['effective_kks']}</b></div><div class='kpi'><label>设备级编码</label><b>{metrics['device_level_codes']}</b></div><div class='kpi'><label>重复编码</label><b>{metrics['duplicate_codes']}</b></div><div class='kpi'><label>父级错误</label><b>{metrics['parent_errors']}</b></div><div class='kpi'><label>高风险问题（P0）</label><b>{metrics['p0']}</b></div><div class='kpi'><label>待治理问题（P1）</label><b>{metrics['p1']}</b></div><div class='kpi'><label>历史迁移问题（P2）</label><b>{metrics['p2']}</b></div></div></section>
-<section class='section'><h2>三、KKS 八维审核结果</h2><table><thead><tr><th>维度</th><th>检查项</th><th>结果</th><th>说明</th></tr></thead><tbody>{dimension_rows}</tbody></table></section>
-<section class='section'><h2>四、P0/P1/P2 问题分析</h2><div class='priority-grid'>{priority_rows}</div></section>
-<section class='section'><h2>五、问题整改建议</h2><div class='advice'>优先处理 P0 阻断问题；再治理 P1 扩展编码；P2 历史迁移保留原始证据，不直接覆盖源 Excel。其余规则提示仍保留在详细问题清单，整改完成后应重新审核，并在目标库做导入前验证。</div><h3 style='margin-top:18px'>审核方法</h3><ol class='methods'>{methods_html}</ol></section>
-<section class='section'><h2>六、导入评估结论</h2><div class='import'>{html.escape(report_import_conclusion(result))}<br><span style='font-weight:400'>源 Excel 始终只读；本次未连接真实 DM8/LOCATIONS 做导入验证。</span></div>{comparison_html}</section>
-<section class='section'><h2>七、详细问题清单</h2><table><thead><tr><th>等级</th><th>规则</th><th>行号</th><th>KKS</th><th>问题</th><th>整改建议</th></tr></thead><tbody>{rows_html}</tbody></table></section>
-<section class='section'><details class='technical'><summary>查看 AI 语义复核依据（技术人员）</summary><p class='meta'>{ai_meta} AI 仅对规则筛出的不确定项提供辅助判断，正式结论仍保留规则证据和人工确认入口。</p><table><thead><tr><th>等级</th><th>行号</th><th>KKS</th><th>AI 依据</th></tr></thead><tbody>{ai_rows}</tbody></table></details><details class='technical'><summary>查看结构扫描备注</summary><ul>{notes_html}</ul></details></section>
-<p class='footer'>本报告定位为 KKS 编码质量审核验收报告。源 Excel 未修改；AI 复核过程和详细证据已保留在折叠区域及问题 Excel 的“AI复核（技术）”隐藏页。</p></main></body></html>"""
-    path.write_text(body, encoding="utf-8")
+    path.write_text(render_html(result, overview), encoding="utf-8")
 
 
 def main() -> int:
